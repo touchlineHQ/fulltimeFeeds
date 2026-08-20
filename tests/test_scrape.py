@@ -4,7 +4,9 @@ Unit tests for scraper/scrape.py — name normalisation and club grouping.
 Run with: pytest tests/
 """
 
+import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -12,10 +14,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "scraper"))
 
 from scrape import (
+    Fixture,
     build_prefix_counts,
     clean_team_name,
     infer_club_name,
     _normalise_for_grouping,
+    fixtures_to_ics,
     parse_results,
     parse_fixtures,
 )
@@ -361,3 +365,59 @@ class TestParseResultsVenueDivision:
         assert results[0].division_label != "Unknown Division", (
             "Got 'Unknown Division' even though division was present in HTML"
         )
+
+
+# ---------------------------------------------------------------------------
+# fixtures_to_ics — DTEND must honour a full 60-min slot
+# ---------------------------------------------------------------------------
+
+def _make_fixture(ko: str = "") -> Fixture:
+    return Fixture(
+        date="22/03/26",
+        time=ko,
+        home_team="Home FC U10",
+        away_team="Away FC U10",
+        venue="Meadow Lane NG2 3HJ",
+        division_label="U10 Sun Spring Div 3 Red",
+    )
+
+
+def _event_times(ko: str = "") -> tuple[datetime, datetime]:
+    ics = fixtures_to_ics("Home FC U10", [_make_fixture(ko)])
+    start = re.search(r"DTSTART;TZID=Europe/London:(\d{8}T\d{6})", ics)
+    end = re.search(r"DTEND;TZID=Europe/London:(\d{8}T\d{6})", ics)
+    assert start and end, f"DTSTART/DTEND missing from ICS:\n{ics}"
+    return (
+        datetime.strptime(start.group(1), "%Y%m%dT%H%M%S"),
+        datetime.strptime(end.group(1), "%Y%m%dT%H%M%S"),
+    )
+
+
+class TestFixturesToIcsDuration:
+    """A fixture's DTEND must be exactly 60 minutes after its KO time."""
+
+    def test_off_hour_ko_keeps_full_duration(self):
+        """Bug: 10:15 KO must end at 11:15, not snap to 11:00."""
+        start, end = _event_times("10:15")
+        assert start == datetime(2026, 3, 22, 10, 15)
+        assert end == datetime(2026, 3, 22, 11, 15)
+
+    def test_on_the_hour_ko(self):
+        start, end = _event_times("10:00")
+        assert start == datetime(2026, 3, 22, 10, 0)
+        assert end == datetime(2026, 3, 22, 11, 0)
+
+    def test_hour_rollover(self):
+        start, end = _event_times("11:45")
+        assert start == datetime(2026, 3, 22, 11, 45)
+        assert end == datetime(2026, 3, 22, 12, 45)
+
+    def test_midnight_rollover(self):
+        start, end = _event_times("23:30")
+        assert start == datetime(2026, 3, 22, 23, 30)
+        assert end == datetime(2026, 3, 23, 0, 30)
+
+    def test_tbc_defaults_to_10am(self):
+        start, end = _event_times("")
+        assert start == datetime(2026, 3, 22, 10, 0)
+        assert end == datetime(2026, 3, 22, 11, 0)

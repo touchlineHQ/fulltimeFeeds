@@ -9,7 +9,7 @@ import re
 import time
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import NamedTuple
 
@@ -618,7 +618,7 @@ def fixtures_to_ics(team_name: str, fixtures: list[Fixture]) -> str:
         dt_start = parse_dt(f.date, f.time)
         if not dt_start:
             continue
-        dt_end = dt_start.replace(hour=dt_start.hour + 1, minute=0)  # assume 60min slot
+        dt_end = dt_start + timedelta(minutes=60)  # assume 60min slot
         is_home = f.home_team == team_name
         opponent = f.away_team if is_home else f.home_team
         home_away = "Home" if is_home else "Away"
