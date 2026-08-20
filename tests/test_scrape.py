@@ -22,7 +22,9 @@ from scrape import (
     fixtures_to_ics,
     parse_results,
     parse_fixtures,
+    restore_league_from_bucket,
 )
+import scrape
 
 
 def _pipeline(raw_names):
@@ -421,3 +423,82 @@ class TestFixturesToIcsDuration:
         start, end = _event_times("")
         assert start == datetime(2026, 3, 22, 10, 0)
         assert end == datetime(2026, 3, 22, 11, 0)
+
+
+# ---------------------------------------------------------------------------
+# restore_league_from_bucket — falls back to last published R2 state
+# ---------------------------------------------------------------------------
+
+class _FakePaginator:
+    def __init__(self, objects):
+        self._objects = objects
+
+    def paginate(self, **kwargs):
+        prefix = kwargs.get("Prefix", "")
+        yield {"Contents": [{"Key": k} for k in self._objects if k.startswith(prefix)]}
+
+
+class _FakeS3:
+    def __init__(self, objects):
+        self._objects = objects
+
+    def get_paginator(self, name):
+        return _FakePaginator(self._objects)
+
+    def get_object(self, **kwargs):
+        key = kwargs["Key"]
+
+        class _Body:
+            def read(self):
+                return ('{"league": "YEL"}' + f" //{key}").encode("utf-8")
+
+        return {"Body": _Body()}
+
+
+class TestRestoreLeagueFromBucket:
+
+    def test_restores_feeds_and_calendars(self, tmp_path, monkeypatch):
+        scrape.FEEDS_DIR = tmp_path / "feeds"
+        scrape.OUTPUT_DIR = tmp_path / "calendars"
+        monkeypatch.setenv("R2_BUCKET_NAME", "test-bucket")
+        monkeypatch.setattr(
+            scrape, "_s3_client",
+            lambda: _FakeS3([
+                "feeds/yel-sunday/teams.json",
+                "feeds/yel-sunday/teams/east-leake-bantams-green-u12.json",
+                "feeds/yel-sunday/fixtures.json",
+                "calendars/yel-sunday/east-leake-bantams-green-u12.ics",
+            ]),
+        )
+
+        restored = restore_league_from_bucket("YEL Sunday", "yel-sunday")
+
+        assert restored == 4
+        teams_file = tmp_path / "feeds" / "yel-sunday" / "teams.json"
+        assert teams_file.is_file()
+        assert (tmp_path / "feeds" / "yel-sunday" / "teams" / "east-leake-bantams-green-u12.json").is_file()
+        assert (tmp_path / "calendars" / "yel-sunday" / "east-leake-bantams-green-u12.ics").is_file()
+        assert teams_file.read_text(encoding="utf-8").startswith('{"league": "YEL"}')
+
+    def test_skips_already_present_files(self, tmp_path, monkeypatch):
+        scrape.FEEDS_DIR = tmp_path / "feeds"
+        scrape.OUTPUT_DIR = tmp_path / "calendars"
+        monkeypatch.setenv("R2_BUCKET_NAME", "test-bucket")
+        existing = tmp_path / "feeds" / "yel-sunday" / "teams.json"
+        existing.parent.mkdir(parents=True)
+        existing.write_text("already here", encoding="utf-8")
+        monkeypatch.setattr(
+            scrape, "_s3_client",
+            lambda: _FakeS3(["feeds/yel-sunday/teams.json"]),
+        )
+
+        assert restore_league_from_bucket("YEL Sunday", "yel-sunday") == 0
+        assert existing.read_text(encoding="utf-8") == "already here"
+
+    def test_returns_zero_without_bucket_configured(self, tmp_path, monkeypatch):
+        scrape.FEEDS_DIR = tmp_path / "feeds"
+        scrape.OUTPUT_DIR = tmp_path / "calendars"
+        monkeypatch.setenv("R2_BUCKET_NAME", "")
+        monkeypatch.setattr(scrape, "_s3_client", lambda: None)
+
+        assert restore_league_from_bucket("YEL Sunday", "yel-sunday") == 0

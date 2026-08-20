@@ -15,6 +15,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
 
+from index import write_index
+
 FEEDS_DIR = Path(__file__).parent.parent / "feeds"
 
 LEAGUE_NAME = "Demo FC"
@@ -206,6 +208,22 @@ def _build_result_entry(
     }
 
 
+_FIXTURE_KEYS = ("id", "date", "time", "home_team", "away_team", "venue", "division")
+_RESULT_KEYS = ("id", "date", "time", "home_team", "away_team", "home_score", "away_score", "venue", "division")
+
+
+def _dedupe_by_id(rows: list[dict]) -> list[dict]:
+    """Drop duplicate match entries (a match appears once per participating team)."""
+    seen: set[str] = set()
+    out: list[dict] = []
+    for row in rows:
+        if row["id"] in seen:
+            continue
+        seen.add(row["id"])
+        out.append(row)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Generator
 # ---------------------------------------------------------------------------
@@ -264,7 +282,7 @@ def generate(today: date | None = None) -> None:
 
         index_teams.append({"name": td.name, "slug": td.slug})
 
-    # ------------------------------------------------------------------ club feed
+    # --------------------------------------------------------------- club feed
     clubs_dir = FEEDS_DIR / "clubs"
     clubs_dir.mkdir(exist_ok=True)
     club_feed = {
@@ -275,32 +293,40 @@ def generate(today: date | None = None) -> None:
     }
     (clubs_dir / f"{CLUB_SLUG}.json").write_text(json.dumps(club_feed, indent=2) + "\n")
 
-    # -------------------------------------------------------------- index.json
-    index_path = FEEDS_DIR / "index.json"
-    if index_path.exists():
-        index = json.loads(index_path.read_text())
-    else:
-        index = {"generated": generated_ts, "leagues": [], "clubs": []}
+    # ------------------------------------------ league feeds (fixtures/results/teams)
+    fixtures_payload = {
+        "league": LEAGUE_NAME,
+        "generated": generated_ts,
+        "fixtures": sorted(
+            [{k: f[k] for k in _FIXTURE_KEYS} for f in _dedupe_by_id(club_fixtures)],
+            key=lambda x: (x["date"], x["time"]),
+        ),
+    }
+    (league_dir / "fixtures.json").write_text(json.dumps(fixtures_payload, indent=2) + "\n")
 
-    league_entry = {
-        "name": LEAGUE_NAME,
-        "slug": LEAGUE_SLUG,
+    results_payload = {
+        "league": LEAGUE_NAME,
+        "generated": generated_ts,
+        "results": sorted(
+            [{k: r[k] for k in _RESULT_KEYS} for r in _dedupe_by_id(club_results)],
+            key=lambda x: (x["date"], x["time"]),
+            reverse=True,
+        ),
+    }
+    (league_dir / "results.json").write_text(json.dumps(results_payload, indent=2) + "\n")
+
+    index_teams.sort(key=lambda t: t["name"])
+    teams_payload = {
+        "league": LEAGUE_NAME,
+        "generated": generated_ts,
         "teams": index_teams,
     }
-    index["leagues"] = [lg for lg in index.get("leagues", []) if lg.get("slug") != LEAGUE_SLUG]
-    index["leagues"].append(league_entry)
+    (league_dir / "teams.json").write_text(json.dumps(teams_payload, indent=2) + "\n")
 
-    club_entry = {
-        "name": CLUB_NAME,
-        "slug": CLUB_SLUG,
-        "teams": [t["name"] for t in index_teams],
-    }
-    index["clubs"] = [cl for cl in index.get("clubs", []) if cl.get("slug") != CLUB_SLUG]
-    index["clubs"].append(club_entry)
+    # -------------------------------------------------------------- index.json
+    write_index(generated=generated_ts)
 
-    index_path.write_text(json.dumps(index, indent=2) + "\n")
-
-    print(f"Demo FC: wrote {len(index_teams)} team feeds + club feed + updated index.json")
+    print(f"Demo FC: wrote {len(index_teams)} team feeds + club feed + league feeds + updated index.json")
 
 
 if __name__ == "__main__":

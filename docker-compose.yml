@@ -8,7 +8,12 @@ services:
     # Automatically injects all variables found in your local .env file
     env_file:
       - .env
-    # Optional: If you still want a local copy of the data on your host machine 
-    # alongside the Cloudflare upload, uncomment the lines below:
-    # volumes:
-    #   - ./:/app
+    # Persist published feeds/calendars across runs so a league that fails to
+    # fetch one run keeps its previously published data (and stays in index.json).
+    volumes:
+      - scraper_feeds:/app/feeds
+      - scraper_calendars:/app/calendars
+
+volumes:
+  scraper_feeds:
+  scraper_calendars:

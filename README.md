@@ -26,11 +26,28 @@ All feeds are published under `feeds/` and can be fetched as R2 URLs. They updat
 
 | File | Contents |
 |---|---|
-| `feeds/index.json` | All leagues, teams, and clubs with their slugs |
-| `feeds/<league>/fixtures.json` | Every upcoming fixture in a league, sorted by date/time |
-| `feeds/<league>/results.json` | Every result in a league, most recent first |
-| `feeds/<league>/teams/<team>.json` | Fixtures and results for one team |
-| `feeds/clubs/<club>.json` | Fixtures and results for every team in a club, across leagues |
+| `feeds/index.json` | All leagues and clubs, each with their slugs |
+
+`feeds/index.json` is an envelope with a `generated` timestamp, a `leagues`
+array, and a `clubs` array:
+
+```json
+{
+  "generated": "2026-08-20T15:36:10Z",
+  "leagues": [
+    {
+      "name": "Euro Soccer Nottinghamshire Senior League 26/27",
+      "slug": "euro-soccer-nottinghamshire-senior-league-26-27",
+      "teams": [
+        { "name": "Arnold Town", "slug": "arnold-town" }
+      ]
+    }
+  ],
+  "clubs": [
+    { "name": "Arnold Town", "slug": "arnold-town", "league": "Euro Soccer Nottinghamshire Senior League 26/27" }
+  ]
+}
+```
 
 ### Club feeds
 
@@ -81,7 +98,7 @@ const url = 'https://fixtures.touchlinehq.co.uk/feeds/clubs/arnold-town.json';
 const { club, fixtures } = await fetch(url).then(r => r.json());
 ```
 
-Use `feeds/index.json` to discover available club and team slugs programmatically.
+Use `feeds/index.json` to discover available league, team, and club slugs, and browse `feeds/clubs/` for club feeds.
 
 ## How it works
 
@@ -108,14 +125,18 @@ At the start of each season, update the `LEAGUES` list in `scraper/scrape.py` wi
 
 ## Running locally
 
-The recommended way is Docker — it matches the production setup (installs Tor, Playwright, and uploads to R2):
+The recommended way is Docker — it matches the production setup (fetches directly, runs Playwright, and uploads to R2):
 
 ```bash
 docker compose up --build
-# .ics files written to ./calendars/<league>/ (inside the container)
-# JSON feeds written to ./feeds/ (inside the container)
+# .ics files written to the 'scraper_calendars' volume (./calendars/<league>/)
+# JSON feeds written to the 'scraper_feeds' volume (./feeds/)
 # All files uploaded to Cloudflare R2 by upload.py
 ```
+
+Feeds and calendars are stored in named Docker volumes, so previously published
+data survives container restarts. If a league fails to fetch on a run, the scraper
+restores that league's last published files from R2 so it stays in `index.json`.
 
 To run the scraper directly on the host:
 
@@ -143,5 +164,5 @@ Run `scripts/run_scraper.sh` manually any time to force a refresh.
 - Kick-off times default to **10:00** if Full-Time doesn't list a time (common for youth Sunday football)
 - Event duration is set to **60 minutes**
 - Team names are taken verbatim from Full-Time
-- The scraper uses `curl-cffi` with browser impersonation to fetch the page reliably
-- Stale calendars and feeds (removed teams/leagues) are automatically cleaned up on each run
+- The scraper uses `curl-cffi` with browser impersonation to fetch the page reliably (directly, no proxy)
+- When a league produces no data on a run, its previously published feeds are restored from R2 rather than dropped

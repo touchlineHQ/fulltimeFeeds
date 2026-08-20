@@ -16,6 +16,8 @@ from typing import NamedTuple
 from curl_cffi import requests as curl_requests
 from bs4 import BeautifulSoup
 
+from index import write_index
+
 logging.basicConfig(
     level=logging.DEBUG if os.environ.get("DEBUG") else logging.INFO,
     format="%(levelname)s %(message)s",
@@ -32,13 +34,13 @@ RESULTS_URL = "https://fulltime.thefa.com/results/1/100000.html"
 # Each league is identified by its selectedSeason parameter on Full-Time.
 # Update these season IDs at the start of each new season.
 LEAGUES: list[tuple[str, str]] = [
-    ("909330396", "YEL East Midlands Sunday 25/26"),
+    #("909330396", "YEL East Midlands Sunday 25/26"),
     ("876713597", "YEL East Midlands Sunday 26/27"),
-    ("161954265", "YEL East Midlands Saturday 25/26"),
+    #("161954265", "YEL East Midlands Saturday 25/26"),
     ("773286682", "YEL East Midlands Saturday 26/27"),
-    ("355008724", "Euro Soccer Nottinghamshire Senior League 25/26"),
+    #("355008724", "Euro Soccer Nottinghamshire Senior League 25/26"),
     ("918978398", "Euro Soccer Nottinghamshire Senior League 26/27"),
-    ("258824685", "Nottinghamshire Girls and Ladies Football League 25/26"),
+    #("258824685", "Nottinghamshire Girls and Ladies Football League 25/26"),
     ("179857386", "Nottinghamshire Girls and Ladies Football League 26/27"),
 ]
 
@@ -84,13 +86,10 @@ class Result(NamedTuple):
 
 def _fetch_page(url: str, label: str) -> str:
     """Fetch a URL with retries and browser impersonation. Returns response text."""
-    proxy = os.environ.get("SOCKS_PROXY")
-    proxies = {"https": proxy, "http": proxy} if proxy else None
-
     last_err: Exception | None = None
     for attempt in range(1, HTTP_RETRIES + 1):
         try:
-            with curl_requests.Session(impersonate="chrome", proxies=proxies) as session:
+            with curl_requests.Session(impersonate="chrome") as session:
                 resp = session.get(url, timeout=HTTP_TIMEOUT)
                 resp.raise_for_status()
                 return resp.text
@@ -129,21 +128,11 @@ def _fetch_page_js(url: str, label: str) -> str:
         log.error("playwright not installed — cannot fetch JS-rendered results page")
         return ""
 
-    proxy = os.environ.get("SOCKS_PROXY")
-    proxy_settings = None
-    if proxy:
-        # Playwright speaks socks5://, not the curl-style socks5h:// variant
-        server = proxy.replace("socks5h://", "socks5://")
-        proxy_settings = {"server": server}
-
     last_err: Exception | None = None
     for attempt in range(1, HTTP_RETRIES + 1):
         try:
             with sync_playwright() as pw:
-                browser = pw.chromium.launch(
-                    headless=True,
-                    proxy=proxy_settings,
-                )
+                browser = pw.chromium.launch(headless=True)
                 try:
                     context = browser.new_context()
                     # Pre-accept OneTrust consent as a belt-and-suspenders measure
@@ -724,6 +713,26 @@ def write_league_feed(
     log.info(f"  Written {out_r} ({len(results)} results)")
 
 
+def write_league_teams(
+    league_name: str,
+    league_slug: str,
+    teams: list[dict],
+    generated: str,
+) -> None:
+    """Write teams.json for a league, listing its teams with name/slug pairs."""
+    league_dir = FEEDS_DIR / league_slug
+    league_dir.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "league": league_name,
+        "generated": generated,
+        "teams": sorted(teams, key=lambda t: t["name"]),
+    }
+    out = league_dir / "teams.json"
+    out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    log.info(f"  Written {out} ({len(payload['teams'])} teams)")
+
+
 def write_team_feed(
     team_name: str,
     team_slug: str,
@@ -1129,26 +1138,78 @@ def write_club_feed(
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def write_index(league_entries: list[dict], club_entries: list[dict], generated: str) -> None:
-    """Write a top-level index.json listing all leagues, teams, and clubs."""
-    payload = {
-        "generated": generated,
-        "leagues": league_entries,
-        "clubs": club_entries,
-    }
-    out = FEEDS_DIR / "index.json"
-    out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    log.info(f"  Written {out}")
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+def _s3_client() -> object | None:
+    """Build an R2 S3 client from environment variables, or None when not configured."""
+    account_id = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID")
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    if not (account_id and access_key and secret_key):
+        return None
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        service_name="s3",
+        endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name="auto",
+        config=Config(
+            signature_version="s3v4",
+            s3={"payload_signing_enabled": False},
+        ),
+    )
+
+
+def restore_league_from_bucket(league_name: str, league_slug: str) -> int:
+    """Download last-published league files from R2 back into local feeds/ and calendars/.
+
+    Used when a league produced no data this run (e.g. a transient fetch failure) so the
+    league's previously published feeds survive into the next index build and upload.
+    Returns the number of files restored; 0 when there was nothing to restore.
+    """
+    bucket = os.environ.get("R2_BUCKET_NAME")
+    s3 = _s3_client()
+    if s3 is None or not bucket:
+        log.warning(
+            f"  {league_name}: no fresh data and R2 not configured — league left unpublished"
+        )
+        return 0
+
+    restored = 0
+    roots = ((FEEDS_DIR, "feeds"), (OUTPUT_DIR, "calendars"))
+    for local_root, remote_root in roots:
+        prefix = f"{remote_root}/{league_slug}/"
+        try:
+            for obj in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+                for item in obj.get("Contents", []):
+                    key = item["Key"]
+                    if key.endswith("/"):
+                        continue
+                    dest = local_root / league_slug / Path(key).relative_to(prefix)
+                    if dest.exists():
+                        continue
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    body = s3.get_object(Bucket=bucket, Key=key)["Body"]
+                    dest.write_bytes(body.read())
+                    restored += 1
+        except Exception as e:
+            log.warning(f"  {league_name}: failed to restore '{prefix}': {e}")
+
+    if restored:
+        log.warning(
+            f"  {league_name}: restored {restored} file(s) from last published bucket"
+        )
+    return restored
+
+
 def main() -> None:
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     total_teams = 0
-    index_leagues: list[dict] = []
 
     # Accumulate all team fixture/result dicts across leagues for club-level grouping.
     all_team_fixture_rows: list[dict] = []
@@ -1169,7 +1230,10 @@ def main() -> None:
             results = []
 
         if not fixtures and not results:
-            log.warning(f"No data found for {league_name}")
+            log.warning(f"No fresh data found for {league_name}")
+            league_slug_name = slug(league_name)
+            if restore_league_from_bucket(league_name, league_slug_name):
+                log.warning(f"  {league_name}: kept previously published data")
             continue
 
         # Group fixtures/results by team name
@@ -1238,11 +1302,7 @@ def main() -> None:
                 d["goals_against"] = r.away_score if is_home else r.home_score
                 all_team_result_rows.append(d)
 
-        index_leagues.append({
-            "name": league_name,
-            "slug": league_slug_name,
-            "teams": team_index_entries,
-        })
+        write_league_teams(league_name, league_slug_name, team_index_entries, generated)
 
         total_teams += len(all_teams)
 
@@ -1261,7 +1321,6 @@ def main() -> None:
 
     all_clubs = sorted(set(club_fixtures) | set(club_results))
 
-    index_clubs: list[dict] = []
     for club_name in all_clubs:
         club_slug_name = slug(club_name)
         write_club_feed(
@@ -1274,16 +1333,11 @@ def main() -> None:
             {r["team"] for r in club_fixtures.get(club_name, [])}
             | {r["team"] for r in club_results.get(club_name, [])}
         )
-        index_clubs.append({
-            "name": club_name,
-            "slug": club_slug_name,
-            "teams": teams_in_club,
-        })
         log.info(f"  Club feed: {club_slug_name} ({len(teams_in_club)} teams)")
 
-    write_index(index_leagues, index_clubs, generated)
+    write_index(generated=generated)
     log.info(
-        f"\nDone — {total_teams} team calendars, {len(index_clubs)} club feeds, "
+        f"\nDone — {total_teams} team calendars, {len(all_clubs)} club feeds, "
         f"JSON feeds written across {len(LEAGUES)} leagues"
     )
 
