@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  scraper:
+    build: .
+    image: yel-scraper:latest
+    container_name: yel_scraper_container
+    # Automatically injects all variables found in your local .env file
+    env_file:
+      - .env
+    # Optional: If you still want a local copy of the data on your host machine 
+    # alongside the Cloudflare upload, uncomment the lines below:
+    # volumes:
+    #   - ./:/app
