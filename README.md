@@ -34,6 +34,7 @@ array, and a `clubs` array:
 ```json
 {
   "generated": "2026-08-20T15:36:10Z",
+  "from_cache": false,
   "leagues": [
     {
       "name": "Euro Soccer Nottinghamshire Senior League 26/27",
@@ -48,6 +49,15 @@ array, and a `clubs` array:
   ]
 }
 ```
+
+### Staleness flag
+
+If a league could not be scraped on a run (e.g. Full-Time blocking), its last
+published files are restored and re-uploaded, and the affected league entry —
+plus the top-level envelope — gets `"from_cache": true`. Consumers can check
+`index.json.from_cache` / `league.from_cache` to detect stale data. Absent or
+`false` means everything was freshly scraped. The scraper also exits non-zero
+in that case so cron reports the failure.
 
 ### Club feeds
 

@@ -5,7 +5,9 @@ Generates one .ics file per team and JSON feeds across all configured leagues/se
 
 import json
 import os
+import random
 import re
+import sys
 import time
 import hashlib
 import logging
@@ -52,8 +54,30 @@ FEEDS_DIR.mkdir(exist_ok=True)
 
 # Retry configuration for HTTP requests
 HTTP_RETRIES = 5
-HTTP_BACKOFF_FACTOR = 2  # waits 2s, 4s, 8s, 16s, 32s between retries
+HTTP_BACKOFF_FACTOR = 2  # waits 2s, 4s, 8s, 16s, 32s between retries (+ jitter)
 HTTP_TIMEOUT = 90  # seconds
+
+# Explicit browser headers sent on every fetch. Full-Time's WAF rejects
+# non-browser User-Agents with HTTP 403 (observed from 2026-08-23) and also
+# blocks intermittently, so we make each request look as browser-like as
+# possible on top of curl_cffi's TLS impersonation.
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Referer": "https://fulltime.thefa.com/",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -90,16 +114,20 @@ def _fetch_page(url: str, label: str) -> str:
     for attempt in range(1, HTTP_RETRIES + 1):
         try:
             with curl_requests.Session(impersonate="chrome") as session:
+                session.headers.update(BROWSER_HEADERS)
                 resp = session.get(url, timeout=HTTP_TIMEOUT)
                 resp.raise_for_status()
                 return resp.text
         except Exception as e:
             last_err = e
             if attempt < HTTP_RETRIES:
+                # Jittered exponential backoff so repeated daily runs don't
+                # present an identical, bot-shaped retry cadence to the WAF.
                 wait = HTTP_BACKOFF_FACTOR * (2 ** (attempt - 1))
+                wait *= 1 + random.uniform(0, 0.25)
                 log.warning(
                     f"{label} attempt {attempt}/{HTTP_RETRIES} failed: {e} "
-                    f"— retrying in {wait}s"
+                    f"— retrying in {wait:.1f}s"
                 )
                 time.sleep(wait)
             else:
@@ -1207,9 +1235,13 @@ def restore_league_from_bucket(league_name: str, league_slug: str) -> int:
     return restored
 
 
-def main() -> None:
+def main() -> int:
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     total_teams = 0
+
+    # league slug -> True when this run had to fall back to previously
+    # published data instead of scraping fresh (surfaced in index.json).
+    from_cache: dict[str, bool] = {}
 
     # Accumulate all team fixture/result dicts across leagues for club-level grouping.
     all_team_fixture_rows: list[dict] = []
@@ -1232,6 +1264,7 @@ def main() -> None:
         if not fixtures and not results:
             log.warning(f"No fresh data found for {league_name}")
             league_slug_name = slug(league_name)
+            from_cache[league_slug_name] = True
             if restore_league_from_bucket(league_name, league_slug_name):
                 log.warning(f"  {league_name}: kept previously published data")
             continue
@@ -1335,12 +1368,21 @@ def main() -> None:
         )
         log.info(f"  Club feed: {club_slug_name} ({len(teams_in_club)} teams)")
 
-    write_index(generated=generated)
+    write_index(feeds_dir=FEEDS_DIR, generated=generated, from_cache=from_cache)
     log.info(
         f"\nDone — {total_teams} team calendars, {len(all_clubs)} club feeds, "
         f"JSON feeds written across {len(LEAGUES)} leagues"
     )
 
+    if any(from_cache.values()):
+        failed = ", ".join(sorted(from_cache))
+        log.error(
+            f"STALE PUBLISHED DATA — no fresh scrape for: {failed}. "
+            f"Previously published files were re-published for these leagues."
+        )
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

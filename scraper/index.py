@@ -124,18 +124,38 @@ def club_entries(feeds_dir: Path = FEEDS_DIR) -> list[dict]:
     return entries
 
 
-def build_index(feeds_dir: Path = FEEDS_DIR, generated: str | None = None) -> dict:
-    """Build the root index: {"generated", "leagues", "clubs"}."""
+def build_index(
+    feeds_dir: Path = FEEDS_DIR,
+    generated: str | None = None,
+    from_cache: dict[str, bool] | None = None,
+) -> dict:
+    """Build the root index: {"generated", "from_cache", "leagues", "clubs"}.
+
+    `from_cache` maps league slug -> True for leagues whose published data was
+    restored from the last good run rather than freshly scraped. Each affected
+    league entry gets `"from_cache": true`, and the envelope's top-level
+    `"from_cache"` is true when any league was restored.
+    """
+    cache_map = from_cache or {}
+    leagues = league_entries(feeds_dir)
+    for entry in leagues:
+        if cache_map.get(entry["slug"]):
+            entry["from_cache"] = True
     return {
         "generated": generated or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "leagues": league_entries(feeds_dir),
+        "from_cache": any(cache_map.values()),
+        "leagues": leagues,
         "clubs": club_entries(feeds_dir),
     }
 
 
-def write_index(feeds_dir: Path = FEEDS_DIR, generated: str | None = None) -> Path:
-    """Write index.json (the {generated, leagues, clubs} envelope) and return its path."""
-    payload = build_index(feeds_dir, generated)
+def write_index(
+    feeds_dir: Path = FEEDS_DIR,
+    generated: str | None = None,
+    from_cache: dict[str, bool] | None = None,
+) -> Path:
+    """Write index.json (the {generated, from_cache, leagues, clubs} envelope) and return its path."""
+    payload = build_index(feeds_dir, generated, from_cache)
     out = feeds_dir / "index.json"
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     log.info(f"  Written {out} ({len(payload['leagues'])} leagues, {len(payload['clubs'])} clubs)")

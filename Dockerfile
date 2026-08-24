@@ -9,8 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Set the working directory inside the container
 WORKDIR /app
 
-# Install Python packages
-RUN pip install --no-cache-dir curl_cffi beautifulsoup4 playwright lxml boto3
+# Install Python packages (curl_cffi pinned: its browser impersonation must
+# track a recent Chrome to keep Full-Time's WAF happy)
+RUN pip install --no-cache-dir curl_cffi==0.16.1 beautifulsoup4 playwright lxml boto3
 
 # Install Playwright browser binaries and their system dependencies
 RUN playwright install chromium --with-deps
@@ -18,9 +19,7 @@ RUN playwright install chromium --with-deps
 # Copy your repository code into the container
 COPY . /app
 
-# Tell the AWS CLI to point to Cloudflare R2 instead of Amazon S3
-# ENV AWS_DEFAULT_REGION=auto
-# ENV AWS_OUTPUT=json
-
 # Fetch league data, add demo feeds, then publish everything to Cloudflare R2.
-CMD python scraper/scrape.py && python scraper/demo.py && python upload.py
+# A scrape that had to fall back to cached data still publishes whatever fresh
+# leagues it has, but its non-zero exit code is preserved so cron alerts.
+CMD sh -c "python scraper/scrape.py; rc=$?; python scraper/demo.py && python upload.py; exit $rc"

@@ -6,6 +6,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-trap 'docker compose down >/dev/null 2>&1' EXIT
+# Timestamped markers make skipped/never-started runs visible in the log
+# (e.g. when the cron flock silently skips because a previous run held it).
+echo "=== run_scraper start $(date -Is) ==="
+
+trap 'echo "=== run_scraper end $(date -Is) rc=$? ==="; docker compose down >/dev/null 2>&1' EXIT
 
 docker compose up --build

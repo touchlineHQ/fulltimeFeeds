@@ -4,6 +4,7 @@ Unit tests for scraper/scrape.py — name normalisation and club grouping.
 Run with: pytest tests/
 """
 
+import json
 import re
 import sys
 from datetime import datetime
@@ -502,3 +503,76 @@ class TestRestoreLeagueFromBucket:
         monkeypatch.setattr(scrape, "_s3_client", lambda: None)
 
         assert restore_league_from_bucket("YEL Sunday", "yel-sunday") == 0
+
+
+# ---------------------------------------------------------------------------
+# main() — exit codes and from_cache bookkeeping
+# ---------------------------------------------------------------------------
+
+class TestMainExitCodes:
+
+    @staticmethod
+    def _fixture():
+        return Fixture(
+            date="22/08/26", time="10:00",
+            home_team="Arnold Town Blue U11", away_team="Opponent FC U11",
+            venue="The Ground", division_label="U11 Division 1",
+        )
+
+    def _run(self, monkeypatch, tmp_path, outcomes):
+        """outcomes: {league_name: "fresh" | "stale"}; returns (rc, index_payload)."""
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        monkeypatch.setattr(scrape, "OUTPUT_DIR", tmp_path / "calendars")
+        monkeypatch.setattr(
+            scrape, "LEAGUES",
+            [("111", "League A"), ("222", "League B")],
+        )
+
+        def fake_restore(name, slug):
+            # Mirror the real restorer: previously published feeds reappear
+            # on disk so the league stays in the disk-derived index.
+            league_dir = tmp_path / "feeds" / slug
+            league_dir.mkdir(parents=True, exist_ok=True)
+            (league_dir / "teams.json").write_text(
+                json.dumps({"league": name, "teams": []}), encoding="utf-8"
+            )
+            return 4
+
+        monkeypatch.setattr(scrape, "restore_league_from_bucket", fake_restore)
+
+        def fake_fetch_fixtures(season_id, league_name):
+            if outcomes[league_name] == "fresh":
+                return [self._fixture()]
+            raise RuntimeError("HTTP Error 403")
+
+        def fake_fetch_results(season_id, league_name):
+            return []
+
+        monkeypatch.setattr(scrape, "fetch_fixtures", fake_fetch_fixtures)
+        monkeypatch.setattr(scrape, "fetch_results", fake_fetch_results)
+
+        rc = scrape.main()
+
+        index_file = tmp_path / "feeds" / "index.json"
+        payload = json.loads(index_file.read_text(encoding="utf-8"))
+        return rc, payload
+
+    def test_all_fresh_returns_zero_and_unflagged_index(self, tmp_path, monkeypatch):
+        rc, payload = self._run(
+            monkeypatch, tmp_path, {"League A": "fresh", "League B": "fresh"}
+        )
+
+        assert rc == 0
+        assert payload["from_cache"] is False
+        assert all("from_cache" not in e for e in payload["leagues"])
+
+    def test_any_fallback_returns_nonzero_and_flags_index(self, tmp_path, monkeypatch):
+        rc, payload = self._run(
+            monkeypatch, tmp_path, {"League A": "fresh", "League B": "stale"}
+        )
+
+        assert rc == 1
+        assert payload["from_cache"] is True
+        by_slug = {e["slug"]: e for e in payload["leagues"]}
+        assert by_slug["league-b"]["from_cache"] is True
+        assert "from_cache" not in by_slug["league-a"]

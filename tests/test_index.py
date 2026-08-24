@@ -47,8 +47,9 @@ class TestLeagueEntries:
 
         index = build_index(tmp_path, generated="2026-01-01T00:00:00Z")
 
-        assert set(index) == {"generated", "leagues", "clubs"}
+        assert set(index) == {"generated", "from_cache", "leagues", "clubs"}
         assert index["generated"] == "2026-01-01T00:00:00Z"
+        assert index["from_cache"] is False
         assert index["leagues"] == [
             {
                 "name": "League A",
@@ -146,6 +147,7 @@ class TestLeagueEntries:
         index = build_index(tmp_path / "nope", generated="2026-01-01T00:00:00Z")
         assert index == {
             "generated": "2026-01-01T00:00:00Z",
+            "from_cache": False,
             "leagues": [],
             "clubs": [],
         }
@@ -225,6 +227,7 @@ class TestWriteIndex:
         assert json.loads(out.read_text()) == build_index(tmp_path, generated="2026-01-01T00:00:00Z")
         assert json.loads(out.read_text()) == {
             "generated": "2026-01-01T00:00:00Z",
+            "from_cache": False,
             "leagues": [
                 {
                     "name": "ABC League",
@@ -234,3 +237,47 @@ class TestWriteIndex:
             ],
             "clubs": [],
         }
+
+
+class TestFromCache:
+    def test_no_cache_map_means_fresh_envelope_and_leagues(self, tmp_path):
+        _write_teams(tmp_path, "abc", "ABC League", [{"name": "ABC U10", "slug": "abc-u10"}])
+
+        index = build_index(tmp_path, generated="2026-01-01T00:00:00Z")
+
+        assert index["from_cache"] is False
+        assert all("from_cache" not in e for e in index["leagues"])
+
+    def test_restored_league_flagged_per_entry_and_at_top_level(self, tmp_path):
+        _write_teams(tmp_path, "abc", "ABC League", [{"name": "ABC U10", "slug": "abc-u10"}])
+        _write_teams(tmp_path, "xyz", "XYZ League", [{"name": "XYZ U11", "slug": "xyz-u11"}])
+
+        index = build_index(
+            tmp_path, generated="2026-01-01T00:00:00Z", from_cache={"abc": True}
+        )
+
+        assert index["from_cache"] is True
+        by_slug = {e["slug"]: e for e in index["leagues"]}
+        assert by_slug["abc"]["from_cache"] is True
+        assert "from_cache" not in by_slug["xyz"]
+
+    def test_all_fresh_map_leaves_everything_unflagged(self, tmp_path):
+        _write_teams(tmp_path, "abc", "ABC League", [{"name": "ABC U10", "slug": "abc-u10"}])
+
+        index = build_index(
+            tmp_path, generated="2026-01-01T00:00:00Z", from_cache={"abc": False}
+        )
+
+        assert index["from_cache"] is False
+        assert all("from_cache" not in e for e in index["leagues"])
+
+    def test_write_index_persists_from_cache(self, tmp_path):
+        _write_teams(tmp_path, "abc", "ABC League", [{"name": "ABC U10", "slug": "abc-u10"}])
+
+        out = write_index(
+            tmp_path, generated="2026-01-01T00:00:00Z", from_cache={"abc": True}
+        )
+
+        payload = json.loads(out.read_text())
+        assert payload["from_cache"] is True
+        assert payload["leagues"][0]["from_cache"] is True
