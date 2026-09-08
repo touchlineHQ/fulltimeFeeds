@@ -446,21 +446,21 @@ class TestWriteClubFeed:
         write_club_feed("Demo FC", "demo-fc", fixtures, results, GENERATED)
         assert fixtures[0]["away_team"] == "Riverside Rangers U10"
 
-    def test_a_played_u7_fixture_with_no_result_moves_to_participation(self, feeds_dir):
+    def test_a_played_fixture_restricted_only_by_opposition_moves_to_participation(self, feeds_dir):
         # Some leagues never publish a results row at U7, so the match only
         # ever exists as a fixture and would otherwise sit there all season.
         fixtures, _ = self._rows()
         played = {**fixtures[0], "id": "f2", "date": "2026-09-06", "time": "09:00",
-                  "home_team": "Demo FC Bantams Yellow U7",
+                  "home_team": "Demo FC Bantams Yellow",
                   "away_team": "Riverside Rangers U7",
-                  "team": "Demo FC Bantams Yellow U7", "division": "U7 Saturday",
+                  "team": "Demo FC Bantams Yellow", "division": "Sunday League",
                   "opponent": "Riverside Rangers U7"}
         write_club_feed("Demo FC", "demo-fc", [fixtures[0], played], [], GENERATED)
         payload = json.loads((feeds_dir / "clubs" / "demo-fc.json").read_text())
 
         # Gone from fixtures, which now holds only the match still to come.
         assert [f["date"] for f in payload["fixtures"]] == ["2026-09-13"]
-        assert [p["team"] for p in payload["participation"]] == ["Demo FC Bantams Yellow U7"]
+        assert [p["team"] for p in payload["participation"]] == ["Demo FC Bantams Yellow"]
         assert payload["participation"][0]["age_group"] == "U7"
         # It was never a withheld result, so it is not counted as one.
         assert payload["compliance"]["results_withheld"] == 0

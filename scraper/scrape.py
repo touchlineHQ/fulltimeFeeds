@@ -851,9 +851,6 @@ def write_team_feed(
         d["home_away"] = "home" if is_home else "away"
         d["opponent"] = f.away_team if is_home else f.home_team
         team_fixtures.append(d)
-    team_fixtures = safe_fixtures(team_fixtures, subject_team=team_name)
-    team_fixtures.sort(key=lambda x: (x["date"], x["time"]))
-
     team_results = []
     for r in results:
         is_home = r.home_team == team_name
@@ -881,6 +878,8 @@ def write_team_feed(
         existing_ids={record["id"] for record in team_participation},
     )
     team_participation.extend(played)
+    team_fixtures = safe_fixtures(team_fixtures, subject_team=team_name)
+    team_fixtures.sort(key=lambda x: (x["date"], x["time"]))
 
     team_results.sort(key=lambda x: (x["date"], x["time"]), reverse=True)
     team_participation.sort(key=lambda x: (x["date"], x["time"]), reverse=True)
@@ -1255,21 +1254,21 @@ def write_club_feed(
     clubs_dir = FEEDS_DIR / "clubs"
     clubs_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_club_fixtures = [
-        redact_fixture(row, row.get("team")) if is_row_restricted(row) else row
-        for row in team_fixtures
-    ]
     safe_club_results, club_participation = split_results(team_results)
     results_withheld = len(club_participation)
 
     # As in write_team_feed: a played restricted fixture with no results row
     # becomes a participation record instead of lingering as a fixture.
-    safe_club_fixtures, played = played_fixtures(
-        safe_club_fixtures,
+    club_fixtures, played = played_fixtures(
+        team_fixtures,
         generated[:10],
         existing_ids={record["id"] for record in club_participation},
     )
     club_participation.extend(played)
+    safe_club_fixtures = [
+        redact_fixture(row, row.get("team")) if is_row_restricted(row) else row
+        for row in club_fixtures
+    ]
 
     payload = {
         "club": club_name,
