@@ -55,6 +55,9 @@ LEAGUES: list[tuple[str, str]] = [
     ("918978398", "Euro Soccer Nottinghamshire Senior League 26/27"),
     #("258824685", "Nottinghamshire Girls and Ladies Football League 25/26"),
     ("179857386", "Nottinghamshire Girls and Ladies Football League 26/27"),
+    ("204486042", "Nottinghamshire Football League Saturday Youth 26/27"),
+    ("134665924", "Nottinghamshire Football League Sunday Youth 26/27"),
+    ("71450136", "East Midlands Veterans League 26/27"),
 ]
 
 OUTPUT_DIR = Path(__file__).parent.parent / "calendars"
