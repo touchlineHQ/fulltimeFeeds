@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scraper"))
 
 from compliance import (
     OPPONENT_LABEL,
+    played_fixtures,
     age_group,
     compliance_meta,
     is_restricted,
@@ -445,6 +446,25 @@ class TestWriteClubFeed:
         write_club_feed("Demo FC", "demo-fc", fixtures, results, GENERATED)
         assert fixtures[0]["away_team"] == "Riverside Rangers U10"
 
+    def test_a_played_fixture_restricted_only_by_opposition_moves_to_participation(self, feeds_dir):
+        # Some leagues never publish a results row at U7, so the match only
+        # ever exists as a fixture and would otherwise sit there all season.
+        fixtures, _ = self._rows()
+        played = {**fixtures[0], "id": "f2", "date": "2026-09-06", "time": "09:00",
+                  "home_team": "Demo FC Bantams Yellow",
+                  "away_team": "Riverside Rangers U7",
+                  "team": "Demo FC Bantams Yellow", "division": "Sunday League",
+                  "opponent": "Riverside Rangers U7"}
+        write_club_feed("Demo FC", "demo-fc", [fixtures[0], played], [], GENERATED)
+        payload = json.loads((feeds_dir / "clubs" / "demo-fc.json").read_text())
+
+        # Gone from fixtures, which now holds only the match still to come.
+        assert [f["date"] for f in payload["fixtures"]] == ["2026-09-13"]
+        assert [p["team"] for p in payload["participation"]] == ["Demo FC Bantams Yellow"]
+        assert payload["participation"][0]["age_group"] == "U7"
+        # It was never a withheld result, so it is not counted as one.
+        assert payload["compliance"]["results_withheld"] == 0
+
 
 # ---------------------------------------------------------------------------
 # ICS calendars
@@ -525,3 +545,124 @@ def test_u10_published_ids_do_not_depend_on_both_raw_team_names(feeds_dir):
     assert published["fixtures"][0]["id"] != raw_fixture_id
     assert published["participation"][0]["id"] != raw_result_id
     assert calendar_uid != f"UID:{raw_fixture_id}@yel-calendar"
+
+
+# ---------------------------------------------------------------------------
+# Played restricted fixtures the league never moved onto its results page
+# ---------------------------------------------------------------------------
+
+TODAY = GENERATED[:10]
+
+
+def _fixture(**over):
+    row = {
+        "id": "raw-id",
+        "date": "2026-09-06",
+        "time": "10:00",
+        "team": "Demo FC Bantams Yellow U7",
+        "league": "Demo League",
+        "home_away": "home",
+        "division": "U7 Saturday",
+        "opponent": OPPONENT_LABEL,
+        "venue": "",
+        "publication_restricted": True,
+    }
+    row.update(over)
+    return row
+
+
+def test_past_restricted_fixture_becomes_a_participation_record():
+    upcoming, records = played_fixtures([_fixture()], TODAY)
+
+    assert upcoming == []
+    assert len(records) == 1
+    assert records[0]["team"] == "Demo FC Bantams Yellow U7"
+    assert records[0]["age_group"] == "U7"
+    assert records[0]["played"] is True
+    assert records[0]["publication_restricted"] is True
+
+
+def test_the_record_carries_no_opposition_venue_or_score():
+    _, records = played_fixtures([_fixture()], TODAY)
+
+    for field in ("opponent", "venue", "home_team", "away_team",
+                  "home_score", "away_score", "goals_for", "goals_against"):
+        assert field not in records[0]
+
+
+def test_a_fixture_still_to_come_is_left_alone():
+    upcoming, records = played_fixtures([_fixture(date="2026-09-20")], TODAY)
+
+    assert records == []
+    assert len(upcoming) == 1
+
+
+def test_a_fixture_played_today_waits_for_the_next_run():
+    # Moved on the run after the match, never on the strength of a clock
+    # partway through it.
+    upcoming, records = played_fixtures([_fixture(date=TODAY)], TODAY)
+
+    assert records == []
+    assert len(upcoming) == 1
+
+
+def test_open_age_fixtures_are_never_moved():
+    # A missing open-age result may just be late, or the match postponed.
+    row = _fixture(team="Demo FC U14", division="U14 Division 1")
+    upcoming, records = played_fixtures([row], TODAY)
+
+    assert records == []
+    assert len(upcoming) == 1
+
+
+def test_a_match_already_recorded_from_its_result_is_not_repeated():
+    row = _fixture()
+    _, first = played_fixtures([row], TODAY)
+    upcoming, second = played_fixtures(
+        [row], TODAY, existing_ids={record["id"] for record in first},
+    )
+
+    assert second == []
+    # Still removed from the fixture list: it was played either way.
+    assert upcoming == []
+
+
+def test_a_team_feed_fixture_gains_the_team_and_league_it_lacks():
+    # Team-feed fixture rows carry neither, the file itself being the context.
+    row = _fixture()
+    del row["team"]
+    del row["league"]
+
+    _, records = played_fixtures(
+        [row], TODAY, subject_team="Demo FC Bantams Yellow U7", league="Demo League",
+    )
+
+    assert records[0]["team"] == "Demo FC Bantams Yellow U7"
+    assert records[0]["league"] == "Demo League"
+
+
+def test_the_id_matches_the_one_built_from_a_result_for_the_same_match():
+    # Both sides hash the same publishable fields, so a match arriving by
+    # either route is recorded under one id.
+    from_fixture = played_fixtures([_fixture()], TODAY)[1][0]
+    from_result = participation_record({
+        "id": "some-other-raw-id",
+        "date": "2026-09-06",
+        "time": "10:00",
+        "team": "Demo FC Bantams Yellow U7",
+        "league": "Demo League",
+        "home_away": "home",
+        "division": "U7 Saturday",
+    })
+
+    assert from_fixture["id"] == from_result["id"]
+
+
+def test_a_second_pass_moves_nothing():
+    upcoming, records = played_fixtures([_fixture(), _fixture(date="2026-09-20")], TODAY)
+    again, more = played_fixtures(
+        upcoming, TODAY, existing_ids={r["id"] for r in records},
+    )
+
+    assert more == []
+    assert len(again) == 1

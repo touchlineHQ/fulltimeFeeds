@@ -194,6 +194,58 @@ def split_results(rows: list[dict]) -> tuple[list[dict], list[dict]]:
     return publishable, participation
 
 
+def played_fixtures(
+    rows: list[dict],
+    today: str,
+    *,
+    subject_team: str | None = None,
+    league: str | None = None,
+    existing_ids: frozenset[str] | set[str] = frozenset(),
+) -> tuple[list[dict], list[dict]]:
+    """Split fixture rows into (still to come, participation records).
+
+    At U11 and below no result is ever published, so some leagues never move a
+    played match onto their results page at all — it simply stays in the fixture
+    list.  Left alone it would sit there for the rest of the season and the game
+    would appear nowhere, which is the opposite of what participation records
+    are for.
+
+    A restricted fixture dated before *today* has therefore been played, and
+    becomes a participation record like any other restricted match.  Open-age
+    fixtures are never moved: there a missing result more likely means the
+    league has not entered it yet, or the match was postponed, and calling it
+    played would assert something we do not know.
+
+    *today* is the run date ("YYYY-MM-DD"), so a match is only moved on the run
+    after it was played and never on the strength of a clock mid-fixture.
+    *existing_ids* are participation ids already built from result rows; a match
+    present in both is recorded once.
+    """
+    upcoming: list[dict] = []
+    records: list[dict] = []
+    seen = set(existing_ids)
+
+    for row in rows:
+        if not (is_row_restricted(row) and row.get("date", "") < today):
+            upcoming.append(row)
+            continue
+        # A fixture row carries neither of these in a team feed, where the team
+        # is implied by the file it lives in; a participation record has to name
+        # its own team to be worth anything.
+        source = dict(row)
+        if subject_team and not source.get("team"):
+            source["team"] = subject_team
+        if league and not source.get("league"):
+            source["league"] = league
+        record = participation_record(source)
+        if record["id"] in seen:
+            continue
+        seen.add(record["id"])
+        records.append(record)
+
+    return upcoming, records
+
+
 def safe_results(rows: list[dict]) -> tuple[list[dict], int]:
     """Drop restricted result rows.
 
