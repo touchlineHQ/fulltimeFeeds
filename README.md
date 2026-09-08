@@ -132,8 +132,8 @@ Age groups are read from the team names and the division label (`U10`,
 as adult football; where tokens disagree, the youngest wins, so a U12 side
 playing a U11 cup tie is still protected.
 
-Restricted fixture rows carry `"publication_restricted": true`. Every feed also
-carries a `compliance` block:
+Restricted fixture rows carry `"publication_restricted": true`. League fixture
+and result feeds, plus team and club feeds, also carry a `compliance` block:
 
 ```json
 {

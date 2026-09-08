@@ -28,6 +28,7 @@ treated as adult football and published in full; where tokens disagree, the
 youngest one wins, so a U18 side fielding a U11 fixture is still protected.
 """
 
+import hashlib
 import re
 
 # The FA's threshold: teams at this age group and below must not have results
@@ -83,6 +84,30 @@ def is_row_restricted(row: dict) -> bool:
     return age is not None and age <= RESTRICTED_MAX_AGE
 
 
+def restricted_record_id(
+    row: dict,
+    subject_team: str | None = None,
+    record_kind: str = "record",
+) -> str:
+    """Return a stable ID built only from fields safe to publish.
+
+    Restricted feeds must not retain the normal match ID because that ID is
+    derived from both raw team names.  Including the subject team is safe in
+    its own feed and ensures the two teams receive different public IDs for
+    the same match.
+    """
+    public_parts = (
+        record_kind,
+        row.get("date", ""),
+        row.get("time", ""),
+        subject_team or row.get("team", ""),
+        row.get("home_away", ""),
+        row.get("division", ""),
+    )
+    public_key = "\x1f".join(str(part) for part in public_parts)
+    return hashlib.sha256(public_key.encode()).hexdigest()[:32]
+
+
 def redact_fixture(row: dict, subject_team: str | None = None) -> dict:
     """Return a publication-safe copy of a restricted fixture row.
 
@@ -114,6 +139,8 @@ def redact_fixture(row: dict, subject_team: str | None = None) -> dict:
     for score_field in ("home_score", "away_score", "goals_for", "goals_against"):
         out.pop(score_field, None)
 
+    if "id" in out:
+        out["id"] = restricted_record_id(out, subject_team, "fixture")
     out["publication_restricted"] = True
     return out
 
@@ -128,7 +155,7 @@ def safe_fixtures(rows: list[dict], subject_team: str | None = None) -> list[dic
 
 # What survives of a restricted match: enough to say it happened, nothing that
 # says how it went or who it was against.
-_PARTICIPATION_FIELDS = ("id", "date", "time", "team", "league", "home_away", "division")
+_PARTICIPATION_FIELDS = ("date", "time", "team", "league", "home_away", "division")
 
 
 def participation_record(row: dict) -> dict:
@@ -141,6 +168,8 @@ def participation_record(row: dict) -> dict:
     looking empty.  No score, no opposition, no venue survives.
     """
     out = {field: row[field] for field in _PARTICIPATION_FIELDS if field in row}
+    if "id" in row:
+        out["id"] = restricted_record_id(out, record_kind="participation")
     age = row_age_group(row)
     out["age_group"] = f"U{age}" if age is not None else None
     out["played"] = True

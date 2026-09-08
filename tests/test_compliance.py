@@ -7,6 +7,7 @@ a public URL: league feeds, team feeds, club feeds and .ics calendars.
 Run with: pytest tests/
 """
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -481,3 +482,46 @@ class TestRestrictedIcs:
         ics = fixtures_to_ics("Demo FC U10", [away])
         assert "SUMMARY:⚽ Demo FC U10 (Away)" in ics
         assert "Riverside" not in ics
+
+
+def test_u10_published_ids_do_not_depend_on_both_raw_team_names(feeds_dir):
+    """Restricted JSON IDs and calendar UIDs must not encode the raw pairing."""
+    write_team_feed(
+        "Demo FC U10", "team-slug", "Demo League", "demo-league",
+        [U10_FIXTURE], [U10_RESULT], GENERATED,
+    )
+    published = json.loads(
+        (feeds_dir / "demo-league" / "teams" / "team-slug.json").read_text()
+    )
+    calendar_uid = next(
+        line for line in fixtures_to_ics("Demo FC U10", [U10_FIXTURE]).splitlines()
+        if line.startswith("UID:")
+    )
+
+    other_fixture = U10_FIXTURE._replace(away_team="Different Opponent U10")
+    other_result = U10_RESULT._replace(away_team="Different Opponent U10")
+    write_team_feed(
+        "Demo FC U10", "team-slug", "Demo League", "demo-league",
+        [other_fixture], [other_result], GENERATED,
+    )
+    other_published = json.loads(
+        (feeds_dir / "demo-league" / "teams" / "team-slug.json").read_text()
+    )
+    other_calendar_uid = next(
+        line for line in fixtures_to_ics("Demo FC U10", [other_fixture]).splitlines()
+        if line.startswith("UID:")
+    )
+
+    assert published["fixtures"][0]["id"] == other_published["fixtures"][0]["id"]
+    assert published["participation"][0]["id"] == other_published["participation"][0]["id"]
+    assert calendar_uid == other_calendar_uid
+
+    raw_fixture_id = hashlib.md5(
+        f"{U10_FIXTURE.date}|{U10_FIXTURE.home_team}|{U10_FIXTURE.away_team}".encode()
+    ).hexdigest()
+    raw_result_id = hashlib.md5(
+        f"{U10_RESULT.date}|{U10_RESULT.home_team}|{U10_RESULT.away_team}".encode()
+    ).hexdigest()
+    assert published["fixtures"][0]["id"] != raw_fixture_id
+    assert published["participation"][0]["id"] != raw_result_id
+    assert calendar_uid != f"UID:{raw_fixture_id}@yel-calendar"

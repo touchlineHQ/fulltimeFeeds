@@ -23,6 +23,7 @@ from compliance import (
     is_restricted,
     is_row_restricted,
     redact_fixture,
+    restricted_record_id,
     safe_fixtures,
     safe_results,
     split_results,
@@ -636,6 +637,24 @@ def make_uid(fixture: Fixture) -> str:
     return hashlib.md5(key.encode()).hexdigest() + "@yel-calendar"
 
 
+def make_restricted_uid(
+    fixture: Fixture,
+    team_name: str,
+    home_away: str,
+) -> str:
+    """Build a calendar UID without using the restricted opposition name."""
+    public_event = {
+        "date": fixture.date,
+        "time": fixture.time or "10:00",
+        "home_away": home_away.lower(),
+        "division": fixture.division_label,
+    }
+    return (
+        restricted_record_id(public_event, team_name, "calendar")
+        + "@yel-calendar"
+    )
+
+
 def fixtures_to_ics(team_name: str, fixtures: list[Fixture]) -> str:
     dtstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = [VCALENDAR_HEADER.format(cal_name=team_name)]
@@ -656,6 +675,7 @@ def fixtures_to_ics(team_name: str, fixtures: list[Fixture]) -> str:
             team_name, f.home_team, f.away_team, f.division_label
         )
         if restricted:
+            uid = make_restricted_uid(f, team_name, home_away)
             summary = f"{'⚽'} {team_name} ({home_away})"
             description = (
                 f"Division: {f.division_label}\\n"
@@ -664,6 +684,7 @@ def fixtures_to_ics(team_name: str, fixtures: list[Fixture]) -> str:
             )
             location = ""
         else:
+            uid = make_uid(f)
             summary = f"{'⚽'} {team_name} vs {opponent} ({home_away})"
             description = (
                 f"Division: {f.division_label}\\n"
@@ -673,7 +694,7 @@ def fixtures_to_ics(team_name: str, fixtures: list[Fixture]) -> str:
             location = f.venue or ""
 
         event = VEVENT_TEMPLATE.format(
-            uid=make_uid(f),
+            uid=uid,
             dtstamp=dtstamp,
             dtstart=dt_start.strftime("%Y%m%dT%H%M%S"),
             dtend=dt_end.strftime("%Y%m%dT%H%M%S"),
