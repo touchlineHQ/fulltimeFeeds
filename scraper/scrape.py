@@ -25,6 +25,7 @@ from compliance import (
     redact_fixture,
     safe_fixtures,
     safe_results,
+    split_results,
 )
 from index import write_index
 
@@ -815,7 +816,8 @@ def write_team_feed(
 
     At U11 and below the team's own name stays — a club may name its own side —
     but the opposition and venue are removed from each fixture and the results
-    array is left empty.
+    array is left empty.  Those matches reappear in `participation`, which says
+    only that they were played, so a site can still list the team's season.
     """
     team_dir = FEEDS_DIR / league_slug / "teams"
     team_dir.mkdir(parents=True, exist_ok=True)
@@ -834,21 +836,27 @@ def write_team_feed(
     for r in results:
         is_home = r.home_team == team_name
         d = result_to_dict(r)
+        # `team` names the subject of the row. A participation record keeps it
+        # and drops both team names, so without it a consumer cannot tell which
+        # side was ours and has to anonymise the match completely.
+        d["team"] = team_name
         d["home_away"] = "home" if is_home else "away"
         d["opponent"] = r.away_team if is_home else r.home_team
         d["goals_for"] = r.home_score if is_home else r.away_score
         d["goals_against"] = r.away_score if is_home else r.home_score
         team_results.append(d)
-    team_results, results_withheld = safe_results(team_results)
+    team_results, team_participation = split_results(team_results)
     team_results.sort(key=lambda x: (x["date"], x["time"]), reverse=True)
+    team_participation.sort(key=lambda x: (x["date"], x["time"]), reverse=True)
 
     payload = {
         "team": team_name,
         "league": league_name,
         "generated": generated,
-        "compliance": compliance_meta(results_withheld),
+        "compliance": compliance_meta(len(team_participation)),
         "fixtures": team_fixtures,
         "results": team_results,
+        "participation": team_participation,
     }
     out = team_dir / f"{team_slug}.json"
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1205,7 +1213,8 @@ def write_club_feed(
 
     Every row here is already scoped to one of the club's own teams (it carries
     `team` and `home_away`), so restricted fixtures keep that team's name and
-    lose only the opposition and venue.  Restricted results are dropped.
+    lose only the opposition and venue.  Restricted results are dropped, and
+    reappear in `participation` as a record that the match was played.
     """
     clubs_dir = FEEDS_DIR / "clubs"
     clubs_dir.mkdir(parents=True, exist_ok=True)
@@ -1214,14 +1223,15 @@ def write_club_feed(
         redact_fixture(row, row.get("team")) if is_row_restricted(row) else row
         for row in team_fixtures
     ]
-    safe_club_results, results_withheld = safe_results(team_results)
+    safe_club_results, club_participation = split_results(team_results)
 
     payload = {
         "club": club_name,
         "generated": generated,
-        "compliance": compliance_meta(results_withheld),
+        "compliance": compliance_meta(len(club_participation)),
         "fixtures": sorted(safe_club_fixtures, key=lambda x: (x["date"], x["time"])),
         "results": sorted(safe_club_results, key=lambda x: (x["date"], x["time"]), reverse=True),
+        "participation": sorted(club_participation, key=lambda x: (x["date"], x["time"]), reverse=True),
     }
     out = clubs_dir / f"{club_slug}.json"
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")

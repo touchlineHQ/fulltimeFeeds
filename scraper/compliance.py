@@ -16,7 +16,11 @@ For a match at U11 or below:
 
 Fixtures themselves are still published — date, kick-off time, the club's own
 team name, and whether the match is home or away — so parents can still plan
-around them.  U12 and above, and adult football, are published in full.
+around them.  A played match survives as a *participation record* carrying the
+same fields, so a club can say its U10s played on Sunday without saying how it
+went; see `participation_record`.  Consumers should list those matches rather
+than hide them — withholding the score is the point, not erasing the fixture.
+U12 and above, and adult football, are published in full.
 
 Age groups are read from the team names and the division label ("U10",
 "Under 10", "U10 Division 1", ...).  A match with no age token anywhere is
@@ -122,15 +126,53 @@ def safe_fixtures(rows: list[dict], subject_team: str | None = None) -> list[dic
     ]
 
 
+# What survives of a restricted match: enough to say it happened, nothing that
+# says how it went or who it was against.
+_PARTICIPATION_FIELDS = ("id", "date", "time", "team", "league", "home_away", "division")
+
+
+def participation_record(row: dict) -> dict:
+    """Reduce a restricted match to an attendance record.
+
+    Withholding a result is not the same as pretending the match never
+    happened — a club may say its U10s played on Sunday, at home, in their
+    division.  That is the FA's own worked example of an acceptable post, and
+    it lets a site list the match rather than leave a young team's season
+    looking empty.  No score, no opposition, no venue survives.
+    """
+    out = {field: row[field] for field in _PARTICIPATION_FIELDS if field in row}
+    age = row_age_group(row)
+    out["age_group"] = f"U{age}" if age is not None else None
+    out["played"] = True
+    out["publication_restricted"] = True
+    return out
+
+
+def split_results(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split result rows into (publishable results, participation records).
+
+    A result stripped of its score is still a published result, so restricted
+    rows are not redacted into the results array — they come back as
+    participation records instead.
+    """
+    publishable: list[dict] = []
+    participation: list[dict] = []
+    for row in rows:
+        if is_row_restricted(row):
+            participation.append(participation_record(row))
+        else:
+            publishable.append(row)
+    return publishable, participation
+
+
 def safe_results(rows: list[dict]) -> tuple[list[dict], int]:
     """Drop restricted result rows.
 
-    Returns (publishable rows, number withheld).  A result stripped of its
-    score is still a published result, so these are removed rather than
-    redacted.
+    Returns (publishable rows, number withheld).  Use `split_results` where the
+    withheld matches are still wanted as participation records.
     """
-    publishable = [row for row in rows if not is_row_restricted(row)]
-    return publishable, len(rows) - len(publishable)
+    publishable, participation = split_results(rows)
+    return publishable, len(participation)
 
 
 POLICY = (

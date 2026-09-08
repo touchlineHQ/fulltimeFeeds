@@ -27,6 +27,9 @@ All feeds are published under `feeds/` and can be fetched as R2 URLs. They updat
 | File | Contents |
 |---|---|
 | `feeds/index.json` | All leagues and clubs, each with their slugs |
+| `feeds/<league>/fixtures.json`, `results.json`, `teams.json` | League-level feeds |
+| `feeds/<league>/teams/<slug>.json` | One team's fixtures, results and participation |
+| `feeds/clubs/<slug>.json` | A club's teams across all leagues |
 
 `feeds/index.json` is an envelope with a `generated` timestamp, a `leagues`
 array, and a `clubs` array:
@@ -120,6 +123,7 @@ For a match at U11 or below:
 | Venue | ❌ emptied |
 | Score / result | ❌ withheld from `results` entirely |
 | League table | ❌ never generated |
+| That the match was played | ✅ as a participation record — see below |
 
 U12 to U18 and adult teams are published in full.
 
@@ -151,6 +155,21 @@ Two consequences worth knowing about:
   fixtures, redacted.
 - **Calendars follow the same rules.** A U11-and-below `.ics` event is titled
   `⚽ <Team> (Home)` with no opposition and an empty `LOCATION`.
+- **Withheld results come back as participation records.** Team and club feeds
+  carry a `participation` array saying that the match was played, when, and
+  whether it was home or away:
+
+  ```json
+  { "date": "2026-09-06", "team": "Arnold Town Blue U11", "age_group": "U11",
+    "home_away": "away", "division": "U11 Division 1", "played": true }
+  ```
+
+  Withholding a result is not the same as pretending the match never happened.
+  Consumers should **list** these matches with the score, opposition and venue
+  omitted, rather than hide them — a young team whose season simply vanishes
+  tells a parent nothing and reads as a bug. They are absent from league feeds,
+  where adjacent same-date records would let you pair two teams back into a
+  fixture.
 
 Scores are still scraped and are still submitted privately through the league's
 own system where required — this only governs what is published.
@@ -163,6 +182,9 @@ const { club, fixtures } = await fetch(url).then(r => r.json());
 ```
 
 Use `feeds/index.json` to discover available league, team, and club slugs, and browse `feeds/clubs/` for club feeds.
+
+`feeds/clubs/` is cross-league output, not a league, and is excluded from the
+league scan that builds `index.json`.
 
 ## How it works
 

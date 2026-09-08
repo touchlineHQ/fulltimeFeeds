@@ -21,6 +21,7 @@ from compliance import (
     redact_fixture,
     safe_fixtures,
     safe_results,
+    split_results,
 )
 from index import write_index
 
@@ -208,6 +209,9 @@ def _build_result_entry(
         "away_score": as_,
         "venue": VENUE if is_home else "",
         "division": division,
+        # Named so a participation record can say whose match it was — it keeps
+        # `team` and drops both team names.
+        "team": demo_team,
         "home_away": "home" if is_home else "away",
         "opponent": away_team if is_home else home_team,
         "goals_for":     hs if is_home else as_,
@@ -276,14 +280,15 @@ def generate(today: date | None = None) -> None:
         # Demo feeds are published to the same public bucket as real ones, so
         # they go through the same U11-and-below redaction — the demo is also
         # what clubs look at when deciding what their own site will show.
-        team_results, results_withheld = safe_results(results)
+        team_results, team_participation = split_results(results)
         team_feed = {
             "team": td.name,
             "league": LEAGUE_NAME,
             "generated": generated_ts,
-            "compliance": compliance_meta(results_withheld),
+            "compliance": compliance_meta(len(team_participation)),
             "fixtures": safe_fixtures(fixtures, subject_team=td.name),
             "results": team_results,
+            "participation": team_participation,
         }
         (teams_dir / f"{td.slug}.json").write_text(json.dumps(team_feed, indent=2) + "\n")
 
@@ -303,13 +308,14 @@ def generate(today: date | None = None) -> None:
         redact_fixture(row, row.get("team")) if is_row_restricted(row) else row
         for row in club_fixtures
     ]
-    safe_club_results, club_results_withheld = safe_results(club_results)
+    safe_club_results, club_participation = split_results(club_results)
     club_feed = {
         "club": CLUB_NAME,
         "generated": generated_ts,
-        "compliance": compliance_meta(club_results_withheld),
+        "compliance": compliance_meta(len(club_participation)),
         "fixtures": sorted(safe_club_fixtures, key=lambda f: (f["date"], f["team"])),
         "results":  sorted(safe_club_results,  key=lambda r: (r["date"], r["team"]), reverse=True),
+        "participation": sorted(club_participation, key=lambda r: (r["date"], r["team"]), reverse=True),
     }
     (clubs_dir / f"{CLUB_SLUG}.json").write_text(json.dumps(club_feed, indent=2) + "\n")
 

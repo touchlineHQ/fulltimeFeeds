@@ -21,9 +21,11 @@ from compliance import (
     compliance_meta,
     is_restricted,
     is_row_restricted,
+    participation_record,
     redact_fixture,
     safe_fixtures,
     safe_results,
+    split_results,
 )
 from scrape import (
     Fixture,
@@ -223,6 +225,52 @@ class TestSafeFixturesAndResults:
         assert is_row_restricted(row) is False
 
 
+class TestParticipationRecords:
+    """Withholding a result is not the same as pretending the match never
+    happened — the club may still say its U10s played."""
+
+    def test_keeps_when_and_whether_it_was_home(self):
+        entry = participation_record(_result_row())
+        assert entry["date"] == "2026-09-13"
+        assert entry["time"] == "10:30"
+        assert entry["team"] == "Demo FC U10"
+        assert entry["home_away"] == "home"
+        assert entry["division"] == "U10 Sunday"
+        assert entry["age_group"] == "U10"
+        assert entry["played"] is True
+        assert entry["publication_restricted"] is True
+
+    def test_drops_everything_that_says_how_it_went(self):
+        entry = participation_record(_result_row())
+        for field in ("home_score", "away_score", "goals_for", "goals_against",
+                      "home_team", "away_team", "opponent", "venue"):
+            assert field not in entry
+
+    def test_split_results_routes_each_row_to_one_lane(self):
+        young = _result_row()
+        open_age = _result_row(
+            home_team="Demo FC U14", away_team="Riverside Rangers U14",
+            division="U14 Sunday", team="Demo FC U14", opponent="Riverside Rangers U14",
+        )
+        results, participation = split_results([young, open_age])
+        assert results == [open_age]
+        assert [p["team"] for p in participation] == ["Demo FC U10"]
+
+    def test_safe_results_still_reports_the_same_count(self):
+        """safe_results is the older, count-only view of the same split."""
+        rows = [_result_row(), _result_row()]
+        publishable, withheld = safe_results(rows)
+        results, participation = split_results(rows)
+        assert publishable == results
+        assert withheld == len(participation) == 2
+
+    def test_does_not_mutate_the_input(self):
+        row = _result_row()
+        participation_record(row)
+        assert row["home_score"] == 4
+        assert row["opponent"] == "Riverside Rangers U10"
+
+
 class TestComplianceMeta:
 
     def test_reports_the_threshold_and_withheld_count(self):
@@ -319,6 +367,24 @@ class TestWriteTeamFeed:
         assert payload["results"] == []
         assert payload["compliance"]["results_withheld"] == 1
 
+    def test_withheld_result_survives_as_participation(self, feeds_dir):
+        """Consumers list these instead of the result, so a young team's season
+        does not simply vanish."""
+        payload = self._write(feeds_dir, "Demo FC U10", U10_FIXTURE, U10_RESULT)
+        assert len(payload["participation"]) == 1
+        entry = payload["participation"][0]
+        assert entry["team"] == "Demo FC U10"
+        assert entry["date"] == "2026-09-06"
+        assert entry["home_away"] == "home"
+        assert entry["age_group"] == "U10"
+        assert entry["played"] is True
+        for field in ("home_score", "away_score", "opponent", "venue"):
+            assert field not in entry
+
+    def test_open_age_team_has_no_participation_entries(self, feeds_dir):
+        payload = self._write(feeds_dir, "Demo FC U14", U14_FIXTURE, U14_RESULT)
+        assert payload["participation"] == []
+
     def test_restricted_team_keeps_its_own_fixture_details(self, feeds_dir):
         payload = self._write(feeds_dir, "Demo FC U10", U10_FIXTURE, U10_RESULT)
         fixture = payload["fixtures"][0]
@@ -364,6 +430,14 @@ class TestWriteClubFeed:
         assert payload["fixtures"][0]["team"] == "Demo FC U10"
         assert payload["fixtures"][0]["away_team"] == OPPONENT_LABEL
         assert payload["fixtures"][0]["venue"] == ""
+
+    def test_withheld_result_survives_as_participation(self, feeds_dir):
+        fixtures, results = self._rows()
+        write_club_feed("Demo FC", "demo-fc", fixtures, results, GENERATED)
+        payload = json.loads((feeds_dir / "clubs" / "demo-fc.json").read_text())
+
+        assert [p["team"] for p in payload["participation"]] == ["Demo FC U10"]
+        assert payload["participation"][0]["played"] is True
 
     def test_does_not_mutate_the_caller_rows(self, feeds_dir):
         fixtures, results = self._rows()
