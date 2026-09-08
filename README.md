@@ -76,10 +76,10 @@ Fixture (in `fixtures.json` and `fixtures` arrays):
   "id": "481ab77102acbc3a91144ddcffc10c26",
   "date": "2026-03-22",
   "time": "10:00",
-  "home_team": "Arnold Town Blue U11",
-  "away_team": "Opponent FC U11",
+  "home_team": "Arnold Town Blue U13",
+  "away_team": "Opponent FC U13",
   "venue": "The Ground",
-  "division": "U11 Division 1"
+  "division": "U13 Division 1"
 }
 ```
 
@@ -90,16 +90,70 @@ Result (in `results.json` and `results` arrays):
   "id": "...",
   "date": "2026-03-15",
   "time": "10:00",
-  "home_team": "Arnold Town Blue U11",
-  "away_team": "Opponent FC U11",
+  "home_team": "Arnold Town Blue U13",
+  "away_team": "Opponent FC U13",
   "home_score": 3,
   "away_score": 1,
   "venue": "The Ground",
-  "division": "U11 Division 1"
+  "division": "U13 Division 1"
 }
 ```
 
 Team and club feeds additionally include `league`, `team`, `home_away` (`"home"` or `"away"`), `opponent`, and (results only) `goals_for` and `goals_against`.
+
+### Publication rules for U11 and below
+
+The FA prohibits publishing match results and league tables for teams playing at
+Under-11 and below, and the league's guidance extends that to naming the
+opposition or the venue in anything published online. Every file this project
+writes lands on a public URL, so the rules are applied when the data is
+serialised — see `scraper/compliance.py`. Consumers get feeds that are already
+safe to render.
+
+For a match at U11 or below:
+
+| | Published |
+|---|---|
+| Date, kick-off time, division | ✅ |
+| The team's own name, home or away | ✅ in team and club feeds |
+| Opposition name | ❌ replaced with `"Opposition"` |
+| Venue | ❌ emptied |
+| Score / result | ❌ withheld from `results` entirely |
+| League table | ❌ never generated |
+
+U12 to U18 and adult teams are published in full.
+
+Age groups are read from the team names and the division label (`U10`,
+`Under 10`, `U10 Division 1`, …). A match with no age token anywhere is treated
+as adult football; where tokens disagree, the youngest wins, so a U12 side
+playing a U11 cup tie is still protected.
+
+Restricted fixture rows carry `"publication_restricted": true`. Every feed also
+carries a `compliance` block:
+
+```json
+{
+  "compliance": {
+    "policy": "Results and league tables are not published for teams at U11 and below, ...",
+    "restricted_max_age_group": "U11",
+    "results_withheld": 3
+  }
+}
+```
+
+Two consequences worth knowing about:
+
+- **League feeds withhold restricted matches entirely.** A league-wide listing
+  has no subject club — every row would name two teams to each other — so
+  `<league>/fixtures.json` and `<league>/results.json` omit U11-and-below
+  matches and report the count in `compliance.fixtures_withheld` /
+  `compliance.results_withheld`. Use the team or club feed to get those
+  fixtures, redacted.
+- **Calendars follow the same rules.** A U11-and-below `.ics` event is titled
+  `⚽ <Team> (Home)` with no opposition and an empty `LOCATION`.
+
+Scores are still scraped and are still submitted privately through the league's
+own system where required — this only governs what is published.
 
 ### Using a feed on a static site
 
@@ -173,6 +227,7 @@ Run `scripts/run_scraper.sh` manually any time to force a refresh.
 
 - Kick-off times default to **10:00** if Full-Time doesn't list a time (common for youth Sunday football)
 - Event duration is set to **60 minutes**
-- Team names are taken verbatim from Full-Time
+- Team names are taken verbatim from Full-Time, except where the U11-and-below
+  rules above replace an opposition name
 - The scraper uses `curl-cffi` with browser impersonation to fetch the page reliably (directly, no proxy)
 - When a league produces no data on a run, its previously published feeds are restored from R2 rather than dropped

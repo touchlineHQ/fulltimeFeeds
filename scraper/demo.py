@@ -15,6 +15,13 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
 
+from compliance import (
+    compliance_meta,
+    is_row_restricted,
+    redact_fixture,
+    safe_fixtures,
+    safe_results,
+)
 from index import write_index
 
 FEEDS_DIR = Path(__file__).parent.parent / "feeds"
@@ -266,15 +273,22 @@ def generate(today: date | None = None) -> None:
             home, away = (td.name, opp) if is_home else (opp, td.name)
             results.append(_build_result_entry(d, td.kick_off, home, away, td.division, td.name, td.max_goals))
 
+        # Demo feeds are published to the same public bucket as real ones, so
+        # they go through the same U11-and-below redaction — the demo is also
+        # what clubs look at when deciding what their own site will show.
+        team_results, results_withheld = safe_results(results)
         team_feed = {
             "team": td.name,
             "league": LEAGUE_NAME,
             "generated": generated_ts,
-            "fixtures": fixtures,
-            "results": results,
+            "compliance": compliance_meta(results_withheld),
+            "fixtures": safe_fixtures(fixtures, subject_team=td.name),
+            "results": team_results,
         }
         (teams_dir / f"{td.slug}.json").write_text(json.dumps(team_feed, indent=2) + "\n")
 
+        # The club and league feeds redact from the raw rows below, so the
+        # withheld counts they report stay accurate.
         for fix in fixtures:
             club_fixtures.append({**fix, "league": LEAGUE_NAME, "team": td.name})
         for res in results:
@@ -285,30 +299,47 @@ def generate(today: date | None = None) -> None:
     # --------------------------------------------------------------- club feed
     clubs_dir = FEEDS_DIR / "clubs"
     clubs_dir.mkdir(exist_ok=True)
+    safe_club_fixtures = [
+        redact_fixture(row, row.get("team")) if is_row_restricted(row) else row
+        for row in club_fixtures
+    ]
+    safe_club_results, club_results_withheld = safe_results(club_results)
     club_feed = {
         "club": CLUB_NAME,
         "generated": generated_ts,
-        "fixtures": sorted(club_fixtures, key=lambda f: (f["date"], f["team"])),
-        "results":  sorted(club_results,  key=lambda r: (r["date"], r["team"]), reverse=True),
+        "compliance": compliance_meta(club_results_withheld),
+        "fixtures": sorted(safe_club_fixtures, key=lambda f: (f["date"], f["team"])),
+        "results":  sorted(safe_club_results,  key=lambda r: (r["date"], r["team"]), reverse=True),
     }
     (clubs_dir / f"{CLUB_SLUG}.json").write_text(json.dumps(club_feed, indent=2) + "\n")
 
     # ------------------------------------------ league feeds (fixtures/results/teams)
+    # A league-wide listing has no subject club: each row would name two teams
+    # to each other, so U11-and-below matches are withheld from it entirely.
+    league_matches = _dedupe_by_id(club_fixtures)
+    league_fixture_rows = [
+        {k: f[k] for k in _FIXTURE_KEYS} for f in league_matches if not is_row_restricted(f)
+    ]
     fixtures_payload = {
         "league": LEAGUE_NAME,
         "generated": generated_ts,
-        "fixtures": sorted(
-            [{k: f[k] for k in _FIXTURE_KEYS} for f in _dedupe_by_id(club_fixtures)],
-            key=lambda x: (x["date"], x["time"]),
-        ),
+        "compliance": {
+            **compliance_meta(),
+            "fixtures_withheld": len(league_matches) - len(league_fixture_rows),
+        },
+        "fixtures": sorted(league_fixture_rows, key=lambda x: (x["date"], x["time"])),
     }
     (league_dir / "fixtures.json").write_text(json.dumps(fixtures_payload, indent=2) + "\n")
 
+    league_result_rows, league_results_withheld = safe_results(
+        [{k: r[k] for k in _RESULT_KEYS} for r in _dedupe_by_id(club_results)]
+    )
     results_payload = {
         "league": LEAGUE_NAME,
         "generated": generated_ts,
+        "compliance": compliance_meta(league_results_withheld),
         "results": sorted(
-            [{k: r[k] for k in _RESULT_KEYS} for r in _dedupe_by_id(club_results)],
+            league_result_rows,
             key=lambda x: (x["date"], x["time"]),
             reverse=True,
         ),
