@@ -18,6 +18,16 @@ from typing import NamedTuple
 from curl_cffi import requests as curl_requests
 from bs4 import BeautifulSoup
 
+from compliance import (
+    compliance_meta,
+    is_restricted,
+    is_row_restricted,
+    redact_fixture,
+    restricted_record_id,
+    safe_fixtures,
+    safe_results,
+    split_results,
+)
 from index import write_index
 
 logging.basicConfig(
@@ -627,6 +637,24 @@ def make_uid(fixture: Fixture) -> str:
     return hashlib.md5(key.encode()).hexdigest() + "@yel-calendar"
 
 
+def make_restricted_uid(
+    fixture: Fixture,
+    team_name: str,
+    home_away: str,
+) -> str:
+    """Build a calendar UID without using the restricted opposition name."""
+    public_event = {
+        "date": fixture.date,
+        "time": fixture.time or "10:00",
+        "home_away": home_away.lower(),
+        "division": fixture.division_label,
+    }
+    return (
+        restricted_record_id(public_event, team_name, "calendar")
+        + "@yel-calendar"
+    )
+
+
 def fixtures_to_ics(team_name: str, fixtures: list[Fixture]) -> str:
     dtstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = [VCALENDAR_HEADER.format(cal_name=team_name)]
@@ -640,21 +668,39 @@ def fixtures_to_ics(team_name: str, fixtures: list[Fixture]) -> str:
         opponent = f.away_team if is_home else f.home_team
         home_away = "Home" if is_home else "Away"
 
-        summary = f"{'⚽'} {team_name} vs {opponent} ({home_away})"
-        description = (
-            f"Division: {f.division_label}\\n"
-            f"{f.home_team} v {f.away_team}\\n"
-            f"KO: {f.time or 'TBC'}"
+        # Calendars are published on public URLs like everything else, so a
+        # U11-or-below event carries only the club's own team, the kick-off and
+        # whether it is home or away — no opposition, no venue.
+        restricted = is_restricted(
+            team_name, f.home_team, f.away_team, f.division_label
         )
+        if restricted:
+            uid = make_restricted_uid(f, team_name, home_away)
+            summary = f"{'⚽'} {team_name} ({home_away})"
+            description = (
+                f"Division: {f.division_label}\\n"
+                f"KO: {f.time or 'TBC'}\\n"
+                f"Opposition and venue are not published at U11 and below."
+            )
+            location = ""
+        else:
+            uid = make_uid(f)
+            summary = f"{'⚽'} {team_name} vs {opponent} ({home_away})"
+            description = (
+                f"Division: {f.division_label}\\n"
+                f"{f.home_team} v {f.away_team}\\n"
+                f"KO: {f.time or 'TBC'}"
+            )
+            location = f.venue or ""
 
         event = VEVENT_TEMPLATE.format(
-            uid=make_uid(f),
+            uid=uid,
             dtstamp=dtstamp,
             dtstart=dt_start.strftime("%Y%m%dT%H%M%S"),
             dtend=dt_end.strftime("%Y%m%dT%H%M%S"),
             summary=summary,
             description=description,
-            location=f.venue or "",
+            location=location,
         )
         lines.append(event)
 
@@ -711,34 +757,51 @@ def write_league_feed(
     results: list[Result],
     generated: str,
 ) -> None:
-    """Write fixtures.json and results.json for a league."""
+    """Write fixtures.json and results.json for a league.
+
+    League-wide listings have no subject club: every row names two teams to
+    each other, so a U11-or-below match cannot appear here without identifying
+    someone's opposition.  Those matches are withheld from the league feed
+    entirely and counted in `withheld`; they are still published, redacted, in
+    the team and club feeds where a subject team is known.
+    """
     league_dir = FEEDS_DIR / league_slug
     league_dir.mkdir(parents=True, exist_ok=True)
+
+    all_fixture_rows = [fixture_to_dict(f) for f in fixtures]
+    open_fixture_rows = [row for row in all_fixture_rows if not is_row_restricted(row)]
+    fixtures_withheld = len(all_fixture_rows) - len(open_fixture_rows)
 
     fixtures_payload = {
         "league": league_name,
         "generated": generated,
-        "fixtures": sorted(
-            [fixture_to_dict(f) for f in fixtures],
-            key=lambda x: (x["date"], x["time"]),
-        ),
+        "compliance": {**compliance_meta(), "fixtures_withheld": fixtures_withheld},
+        "fixtures": sorted(open_fixture_rows, key=lambda x: (x["date"], x["time"])),
     }
     out_f = league_dir / "fixtures.json"
     out_f.write_text(json.dumps(fixtures_payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    log.info(f"  Written {out_f} ({len(fixtures)} fixtures)")
+    log.info(
+        f"  Written {out_f} ({len(open_fixture_rows)} fixtures, "
+        f"{fixtures_withheld} withheld at U11 and below)"
+    )
 
+    open_result_rows, results_withheld = safe_results([result_to_dict(r) for r in results])
     results_payload = {
         "league": league_name,
         "generated": generated,
+        "compliance": compliance_meta(results_withheld),
         "results": sorted(
-            [result_to_dict(r) for r in results],
+            open_result_rows,
             key=lambda x: (x["date"], x["time"]),
             reverse=True,  # most recent first
         ),
     }
     out_r = league_dir / "results.json"
     out_r.write_text(json.dumps(results_payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    log.info(f"  Written {out_r} ({len(results)} results)")
+    log.info(
+        f"  Written {out_r} ({len(open_result_rows)} results, "
+        f"{results_withheld} withheld at U11 and below)"
+    )
 
 
 def write_league_teams(
@@ -770,7 +833,13 @@ def write_team_feed(
     results: list[Result],
     generated: str,
 ) -> None:
-    """Write a JSON file with fixtures and results relevant to a single team."""
+    """Write a JSON file with fixtures and results relevant to a single team.
+
+    At U11 and below the team's own name stays — a club may name its own side —
+    but the opposition and venue are removed from each fixture and the results
+    array is left empty.  Those matches reappear in `participation`, which says
+    only that they were played, so a site can still list the team's season.
+    """
     team_dir = FEEDS_DIR / league_slug / "teams"
     team_dir.mkdir(parents=True, exist_ok=True)
 
@@ -781,25 +850,34 @@ def write_team_feed(
         d["home_away"] = "home" if is_home else "away"
         d["opponent"] = f.away_team if is_home else f.home_team
         team_fixtures.append(d)
+    team_fixtures = safe_fixtures(team_fixtures, subject_team=team_name)
     team_fixtures.sort(key=lambda x: (x["date"], x["time"]))
 
     team_results = []
     for r in results:
         is_home = r.home_team == team_name
         d = result_to_dict(r)
+        # `team` names the subject of the row. A participation record keeps it
+        # and drops both team names, so without it a consumer cannot tell which
+        # side was ours and has to anonymise the match completely.
+        d["team"] = team_name
         d["home_away"] = "home" if is_home else "away"
         d["opponent"] = r.away_team if is_home else r.home_team
         d["goals_for"] = r.home_score if is_home else r.away_score
         d["goals_against"] = r.away_score if is_home else r.home_score
         team_results.append(d)
+    team_results, team_participation = split_results(team_results)
     team_results.sort(key=lambda x: (x["date"], x["time"]), reverse=True)
+    team_participation.sort(key=lambda x: (x["date"], x["time"]), reverse=True)
 
     payload = {
         "team": team_name,
         "league": league_name,
         "generated": generated,
+        "compliance": compliance_meta(len(team_participation)),
         "fixtures": team_fixtures,
         "results": team_results,
+        "participation": team_participation,
     }
     out = team_dir / f"{team_slug}.json"
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1152,15 +1230,29 @@ def write_club_feed(
     team_results: list[dict],
     generated: str,
 ) -> None:
-    """Write feeds/clubs/<slug>.json aggregating all teams in a club across leagues."""
+    """Write feeds/clubs/<slug>.json aggregating all teams in a club across leagues.
+
+    Every row here is already scoped to one of the club's own teams (it carries
+    `team` and `home_away`), so restricted fixtures keep that team's name and
+    lose only the opposition and venue.  Restricted results are dropped, and
+    reappear in `participation` as a record that the match was played.
+    """
     clubs_dir = FEEDS_DIR / "clubs"
     clubs_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_club_fixtures = [
+        redact_fixture(row, row.get("team")) if is_row_restricted(row) else row
+        for row in team_fixtures
+    ]
+    safe_club_results, club_participation = split_results(team_results)
 
     payload = {
         "club": club_name,
         "generated": generated,
-        "fixtures": sorted(team_fixtures, key=lambda x: (x["date"], x["time"])),
-        "results": sorted(team_results, key=lambda x: (x["date"], x["time"]), reverse=True),
+        "compliance": compliance_meta(len(club_participation)),
+        "fixtures": sorted(safe_club_fixtures, key=lambda x: (x["date"], x["time"])),
+        "results": sorted(safe_club_results, key=lambda x: (x["date"], x["time"]), reverse=True),
+        "participation": sorted(club_participation, key=lambda x: (x["date"], x["time"]), reverse=True),
     }
     out = clubs_dir / f"{club_slug}.json"
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
