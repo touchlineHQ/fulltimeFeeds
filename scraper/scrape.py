@@ -24,6 +24,7 @@ from compliance import (
     is_row_restricted,
     redact_fixture,
     restricted_record_id,
+    played_fixtures,
     safe_fixtures,
     safe_results,
     split_results,
@@ -867,6 +868,20 @@ def write_team_feed(
         d["goals_against"] = r.away_score if is_home else r.home_score
         team_results.append(d)
     team_results, team_participation = split_results(team_results)
+    results_withheld = len(team_participation)
+
+    # A restricted fixture the league never moved onto its results page was
+    # still played once its date has passed; record it rather than leave it
+    # sitting in the fixture list for the rest of the season.
+    team_fixtures, played = played_fixtures(
+        team_fixtures,
+        generated[:10],
+        subject_team=team_name,
+        league=league_name,
+        existing_ids={record["id"] for record in team_participation},
+    )
+    team_participation.extend(played)
+
     team_results.sort(key=lambda x: (x["date"], x["time"]), reverse=True)
     team_participation.sort(key=lambda x: (x["date"], x["time"]), reverse=True)
 
@@ -874,7 +889,7 @@ def write_team_feed(
         "team": team_name,
         "league": league_name,
         "generated": generated,
-        "compliance": compliance_meta(len(team_participation)),
+        "compliance": compliance_meta(results_withheld),
         "fixtures": team_fixtures,
         "results": team_results,
         "participation": team_participation,
@@ -1245,11 +1260,21 @@ def write_club_feed(
         for row in team_fixtures
     ]
     safe_club_results, club_participation = split_results(team_results)
+    results_withheld = len(club_participation)
+
+    # As in write_team_feed: a played restricted fixture with no results row
+    # becomes a participation record instead of lingering as a fixture.
+    safe_club_fixtures, played = played_fixtures(
+        safe_club_fixtures,
+        generated[:10],
+        existing_ids={record["id"] for record in club_participation},
+    )
+    club_participation.extend(played)
 
     payload = {
         "club": club_name,
         "generated": generated,
-        "compliance": compliance_meta(len(club_participation)),
+        "compliance": compliance_meta(results_withheld),
         "fixtures": sorted(safe_club_fixtures, key=lambda x: (x["date"], x["time"])),
         "results": sorted(safe_club_results, key=lambda x: (x["date"], x["time"]), reverse=True),
         "participation": sorted(club_participation, key=lambda x: (x["date"], x["time"]), reverse=True),
