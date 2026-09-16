@@ -941,3 +941,29 @@ class TestResultsUnavailableFlag:
         assert club["results_unavailable"] is True
         assert league["results_unavailable"] is True
         assert team["results_unavailable"] is True
+
+
+# ---------------------------------------------------------------------------
+# Borrowing the operator's own browser session
+# ---------------------------------------------------------------------------
+
+class TestSessionCookies:
+
+    def test_parses_a_cookie_header_as_a_browser_sends_it(self, monkeypatch):
+        monkeypatch.setenv(
+            scrape.COOKIE_ENV, "cf_clearance=abc123; JSESSIONID=xyz; spaced = value "
+        )
+
+        assert scrape._session_cookies() == {
+            "cf_clearance": "abc123", "JSESSIONID": "xyz", "spaced": "value",
+        }
+
+    def test_unset_means_no_cookies(self, monkeypatch):
+        monkeypatch.delenv(scrape.COOKIE_ENV, raising=False)
+
+        assert scrape._session_cookies() == {}
+
+    def test_blank_and_malformed_parts_are_skipped(self, monkeypatch):
+        monkeypatch.setenv(scrape.COOKIE_ENV, "; novalue; =orphan; good=yes;")
+
+        assert scrape._session_cookies() == {"good": "yes"}

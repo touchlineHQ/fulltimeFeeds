@@ -250,9 +250,28 @@ appears on a reachable page cannot be recorded as played, so participation
 covers only restricted fixtures whose date has passed while they sit on the
 fixtures page.
 
-Getting results back means obtaining them from Full-Time through a supported
-route — a league administrator can enable data feeds for club websites — rather
-than from these pages.
+Every Playwright mode is challenged too — headless, `--headless=new`, headed,
+and headed with a persistent profile — because Playwright exposes
+`navigator.webdriver` and CDP whatever the window mode. A browser you drive
+yourself reads those pages fine, so the scraper can borrow that session rather
+than pretend to be something it is not:
+
+```bash
+# from the browser you already read the results page in: DevTools ->
+# Application -> Cookies, or Network -> any request -> Request Headers
+export FULLTIME_COOKIE="cf_clearance=...; JSESSIONID=..."
+export FULLTIME_USER_AGENT="Mozilla/5.0 (...) Chrome/... Safari/537.36"
+```
+
+A clearance cookie is bound to the IP and User-Agent that earned it, so run the
+scraper on the same machine, set the User-Agent to match the browser exactly,
+and refresh the cookie when Cloudflare expires it. Feeds carry
+`results_unavailable` on any run where it has expired, so a stale cookie shows
+up as a flagged feed rather than silently empty results.
+
+`scripts/probe_browser_modes.py` re-checks which automated modes are accepted,
+and `scripts/probe_alt_host.py` looks at `full-time.thefa.com` — the other
+Full-Time host — for an API that would beat parsing HTML entirely.
 
 Each fixture row provides the date, time, home/away teams, venue, and competition (division) name. The scraper generates a `.ics` file and JSON feed per team, plus club-level and league-level JSON feeds, all organised under `calendars/` and `feeds/`.
 

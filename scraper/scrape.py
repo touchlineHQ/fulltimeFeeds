@@ -71,6 +71,37 @@ HTTP_RETRIES = 5
 HTTP_BACKOFF_FACTOR = 2  # waits 2s, 4s, 8s, 16s, 32s between retries (+ jitter)
 HTTP_TIMEOUT = 90  # seconds
 
+# Cloudflare challenges automated clients on the pages carrying scores, and
+# every Playwright mode — headless, --headless=new, headed, headed with a
+# persistent profile — is detected just the same, because Playwright exposes
+# navigator.webdriver and CDP whatever the window mode.  So rather than dress
+# the scraper up as something it is not, it can borrow the session of the
+# browser you already read those pages in: paste that session's cookies into
+# FULLTIME_COOKIE, exactly as the browser sends them
+# ("cf_clearance=...; other=..."), and set FULLTIME_USER_AGENT to that
+# browser's User-Agent.
+#
+# A clearance cookie is bound to the IP and User-Agent that earned it, so the
+# scraper has to run on the same machine and send the same User-Agent, and the
+# cookie has to be refreshed when Cloudflare expires it.  Feeds say
+# `results_unavailable` whenever it has.
+COOKIE_ENV = "FULLTIME_COOKIE"
+USER_AGENT_ENV = "FULLTIME_USER_AGENT"
+
+
+def _session_cookies() -> dict[str, str]:
+    """Parse FULLTIME_COOKIE, as a browser would send it: "a=b; c=d"."""
+    raw = os.environ.get(COOKIE_ENV, "").strip()
+    if not raw:
+        return {}
+    jar: dict[str, str] = {}
+    for part in raw.split(";"):
+        name, _, value = part.partition("=")
+        if name.strip() and value.strip():
+            jar[name.strip()] = value.strip()
+    return jar
+
+
 # Explicit browser headers sent on every fetch. Full-Time's WAF rejects
 # non-browser User-Agents with HTTP 403 (observed from 2026-08-23) and also
 # blocks intermittently, so we make each request look as browser-like as
@@ -129,6 +160,13 @@ def _fetch_page(url: str, label: str) -> str:
         try:
             with curl_requests.Session(impersonate="chrome") as session:
                 session.headers.update(BROWSER_HEADERS)
+                # A clearance cookie is tied to the User-Agent that earned it,
+                # so an override has to reach the headers before the request.
+                user_agent = os.environ.get(USER_AGENT_ENV, "").strip()
+                if user_agent:
+                    session.headers["User-Agent"] = user_agent
+                for name, value in _session_cookies().items():
+                    session.cookies.set(name, value, domain=".thefa.com")
                 resp = session.get(url, timeout=HTTP_TIMEOUT)
                 resp.raise_for_status()
                 return resp.text
