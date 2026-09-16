@@ -1611,6 +1611,11 @@ def _run(browser_holder: list) -> int:
     # them has an incomplete results array, and its feed says so.
     leagues_without_results: set[str] = set()
 
+    # How each league's results were obtained, summarised at the end of the run.
+    # A log this long is unreadable otherwise, and "0 results" means nothing
+    # without knowing whether we were refused or the league has not played.
+    results_report: list[tuple[str, str]] = []
+
     for season_id, league_name in LEAGUES:
         try:
             fixtures = fetch_fixtures(season_id, league_name)
@@ -1619,8 +1624,17 @@ def _run(browser_holder: list) -> int:
             fixtures = []
 
         results_unavailable = False
+        browser_fetches_before = browser.fetches if browser else 0
         try:
             results = fetch_results(season_id, league_name, browser=browser)
+            used_browser = bool(browser) and browser.fetches > browser_fetches_before
+            results_report.append((
+                league_name,
+                f"{len(results)} via {'the browser' if used_browser else 'a plain fetch'}"
+                if results else
+                ("none — league has not played yet"
+                 if not used_browser else "none — the browser reached the page but it was empty"),
+            ))
         except ResultsUnavailable as e:
             log.error(
                 f"RESULTS UNAVAILABLE — {e}. Feeds for this league will say so; "
@@ -1628,9 +1642,11 @@ def _run(browser_holder: list) -> int:
             )
             results = []
             results_unavailable = True
+            results_report.append((league_name, "REFUSED — published as unavailable"))
         except Exception as e:
             log.error(f"Failed to fetch results for {league_name}: {e}")
             results = []
+            results_report.append((league_name, f"FAILED — {e}"))
 
         if not fixtures and not results:
             log.warning(f"No fresh data found for {league_name}")
@@ -1757,6 +1773,12 @@ def _run(browser_holder: list) -> int:
             | {r["team"] for r in club_results.get(club_name, [])}
         )
         log.info(f"  Club feed: {club_slug_name} ({len(teams_in_club)} teams)")
+
+    if results_report:
+        log.info("\nResults per league:")
+        width = max(len(name) for name, _ in results_report)
+        for name, outcome in results_report:
+            log.info(f"  {name:<{width}}  {outcome}")
 
     write_index(feeds_dir=FEEDS_DIR, generated=generated, from_cache=from_cache)
     log.info(

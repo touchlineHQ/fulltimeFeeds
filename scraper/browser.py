@@ -61,6 +61,9 @@ class BrowserSession:
         self._playwright = None
         self._browser = None
         self._context = None
+        # How many pages this session served, so a run can report which
+        # leagues needed it.
+        self.fetches = 0
 
     # -- startup ---------------------------------------------------------
 
@@ -170,6 +173,7 @@ class BrowserSession:
     def fetch(self, url: str, wait_selector: str | None = None) -> str:
         """Return the page's HTML, giving a challenge time to clear itself."""
         self.start()
+        self.fetches += 1
         page = self._context.new_page()
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=120_000)
