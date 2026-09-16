@@ -230,6 +230,10 @@ If a league yields fixtures but no results at all, the run logs
 because the failure is otherwise invisible — an empty `results.json` and no
 participation records read exactly like a season that has not started.
 
+[VERIFYING-RESULTS.md](VERIFYING-RESULTS.md) covers how to check this end of the
+scrape against the live site: what to run, which log line says which strategy
+answered, and what to look for in the published feeds.
+
 Currently configured leagues:
 
 | League | Season ID |
