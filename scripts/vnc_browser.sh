@@ -19,8 +19,18 @@ set -euo pipefail
 PORT="${VNC_PORT:-5900}"
 WEB_PORT="${VNC_WEB_PORT:-6080}"
 PROFILE="${FULLTIME_CHROME_PROFILE:-/app/state/chrome-profile}"
-URL="${1:-https://fulltime.thefa.com/}"
 SCREEN="${VNC_SCREEN:-1280x900x24}"
+
+# Typing a URL into a remote browser from a phone is miserable, so the tabs
+# that answer the usual questions are opened up front: what this machine gets
+# from the results page, and what public IP it comes from — which can then be
+# compared against the same page on the phone itself.
+RESULTS_URL="https://fulltime.thefa.com/results/1/100000.html?selectedSeason=918978398&selectedFixtureGroupKey="
+if [ "$#" -gt 0 ]; then
+    URLS=("$@")
+else
+    URLS=("$RESULTS_URL" "https://api.ipify.org")
+fi
 
 if [ -z "${VNC_PASSWORD:-}" ]; then
     echo "Set VNC_PASSWORD (in .env) before starting." >&2
@@ -94,8 +104,8 @@ fi
 mkdir -p "$PROFILE"
 WIDTH="${SCREEN%%x*}"; REST="${SCREEN#*x}"; HEIGHT="${REST%%x*}"
 "$CHROME" --user-data-dir="$PROFILE" --no-first-run --no-default-browser-check \
-    --no-sandbox --window-size="$WIDTH,$HEIGHT" --window-position=0,0 "$URL" \
-    >/dev/null 2>&1 &
+    --no-sandbox --window-size="$WIDTH,$HEIGHT" --window-position=0,0 \
+    "${URLS[@]}" >/dev/null 2>&1 &
 
 cat <<EOF
 
@@ -108,7 +118,7 @@ cat <<EOF
   Password:        $VNC_SECRET
                    (VNC truncates to 8 characters — this is what to type)
   Browser profile: $PROFILE (kept between runs)
-  Opened:          $URL
+  Tabs opened:     $(printf '%s ' "${URLS[@]}")
 
   Ctrl-C here when you are done.
 
