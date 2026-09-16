@@ -277,22 +277,35 @@ and a launched browser says so — measured on the same binary:
 | Playwright launched it | `true` |
 | Started directly, attached over CDP | `false` |
 
-So the probe also starts the bundled Chromium itself and attaches to it, which
-needs no browser on the host and works on a headless server:
+So `fetch_results` does the same when a plain fetch is refused: it starts the
+bundled Chromium directly, attaches over CDP, and reads the page through it.
+Nothing about the browser is disguised — it is a stock binary that simply was
+not launched by an automation framework.
 
-```bash
-docker run --rm -v "$PWD/scripts:/app/scripts" \
-    yel-scraper:latest python scripts/probe_browser_modes.py
+The plain fetch is always tried first, because it is cheap and succeeds outright
+whenever the client is not being challenged (with `FULLTIME_COOKIE` set, for
+instance). The browser session starts lazily and is reused across every league
+in a run, so a run whose fetches all succeed never launches one:
+
+```
+INFO Fetching results for Euro Soccer ... 
+INFO   results/Euro Soccer: refused a plain fetch — retrying through the browser
+INFO   browser: started Xvfb on :99
+INFO   browser: attached
+INFO   results/Euro Soccer: 143 result(s) via the browser
 ```
 
-On a desktop, `./scripts/start_browser.sh` starts whichever Chrome-family
-browser is installed with a debugging port, and the probe attaches to that
-instead when run with `docker run --network=host ...` so the container can
-reach it (`--stop` when finished).
+Set `RESULTS_BROWSER=0` to keep a run to plain fetches only. If the browser is
+challenged too, `ResultsUnavailable` is raised as before and the feeds carry
+`results_unavailable`.
+
+A containerised browser is not identical to a desktop one — it renders through
+SwiftShader and carries a slim image's font set — so this may or may not be
+accepted. It is not tuned to hide those differences.
 
 `scripts/probe_browser_modes.py` re-checks which automated modes are accepted,
-and `scripts/probe_alt_host.py` looks at `full-time.thefa.com` — the other
-Full-Time host — for an API that would beat parsing HTML entirely.
+and on a desktop `./scripts/start_browser.sh` starts a browser with a debugging
+port for the probe to attach to (`--stop` when finished).
 
 Each fixture row provides the date, time, home/away teams, venue, and competition (division) name. The scraper generates a `.ics` file and JSON feed per team, plus club-level and league-level JSON feeds, all organised under `calendars/` and `feeds/`.
 

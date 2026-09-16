@@ -920,7 +920,7 @@ class TestResultsUnavailableFlag:
             ],
         )
 
-        def refused(season, league):
+        def refused(season, league, browser=None):
             raise scrape.ResultsUnavailable(f"{league}: results page refused")
 
         monkeypatch.setattr(scrape, "fetch_results", refused)
@@ -967,3 +967,139 @@ class TestSessionCookies:
         monkeypatch.setenv(scrape.COOKIE_ENV, "; novalue; =orphan; good=yes;")
 
         assert scrape._session_cookies() == {"good": "yes"}
+
+
+# ---------------------------------------------------------------------------
+# fetch_results — falling back to a browser session
+# ---------------------------------------------------------------------------
+
+class _FakeBrowser:
+    """Stands in for BrowserSession, recording whether it was ever used."""
+
+    def __init__(self, html="", raises=None):
+        self.html = html
+        self.raises = raises
+        self.calls = []
+
+    def fetch(self, url, wait_selector=None):
+        self.calls.append(url)
+        if self.raises:
+            raise self.raises
+        return self.html
+
+
+CHALLENGE = "<html><head><title>Just a moment...</title></head></html>"
+BLOCK = "<html><head><title>Attention Required!</title></head></html>"
+ROWS = "<html><td class='home-team'>A</td></html>"
+
+
+class TestFetchResultsViaBrowser:
+
+    @staticmethod
+    def _result():
+        return scrape.Result(
+            date="12/09/26", time="15:00", home_team="East Leake Robins",
+            away_team="Awsworth Villa", home_score=3, away_score=1,
+            venue="Costock Road", division_label="Division One",
+        )
+
+    def test_plain_fetch_working_leaves_the_browser_untouched(self, monkeypatch):
+        # The expensive path must stay unused when the cheap one answers —
+        # that is what makes the session lazy rather than a launch per league.
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: ROWS)
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [self._result()])
+        browser = _FakeBrowser(html=ROWS)
+
+        assert len(scrape.fetch_results("123", "League A", browser=browser)) == 1
+        assert browser.calls == []
+
+    def test_empty_league_is_not_a_refusal(self, monkeypatch):
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "<html>no rows</html>")
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [])
+        browser = _FakeBrowser()
+
+        assert scrape.fetch_results("123", "League A", browser=browser) == []
+        assert browser.calls == []
+
+    def test_challenge_page_falls_back_to_the_browser(self, monkeypatch):
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: CHALLENGE)
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: [self._result()] if "home-team" in html else [],
+        )
+        browser = _FakeBrowser(html=ROWS)
+
+        results = scrape.fetch_results("123", "League A", browser=browser)
+
+        assert len(results) == 1
+        assert len(browser.calls) == 1
+        assert "selectedSeason=123" in browser.calls[0]
+
+    def test_refused_fetch_falls_back_to_the_browser(self, monkeypatch):
+        def blocked(url, label):
+            raise RuntimeError("HTTP Error 403")
+
+        monkeypatch.setattr(scrape, "_fetch_page", blocked)
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: [self._result()] if "home-team" in html else [],
+        )
+        browser = _FakeBrowser(html=ROWS)
+
+        assert len(scrape.fetch_results("123", "League A", browser=browser)) == 1
+        assert len(browser.calls) == 1
+
+    def test_browser_challenged_too_raises_results_unavailable(self, monkeypatch):
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
+        browser = _FakeBrowser(html=CHALLENGE)
+
+        with pytest.raises(scrape.ResultsUnavailable, match="challenged the browser"):
+            scrape.fetch_results("123", "League A", browser=browser)
+
+    def test_no_browser_available_raises_results_unavailable(self, monkeypatch):
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
+
+        with pytest.raises(scrape.ResultsUnavailable, match="no browser session"):
+            scrape.fetch_results("123", "League A", browser=None)
+
+    def test_unstartable_browser_raises_results_unavailable(self, monkeypatch):
+        from browser import BrowserUnavailable
+
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
+        browser = _FakeBrowser(raises=BrowserUnavailable("no Xvfb"))
+
+        with pytest.raises(scrape.ResultsUnavailable, match="no browser to retry"):
+            scrape.fetch_results("123", "League A", browser=browser)
+
+
+class TestResultsBrowserSwitch:
+
+    def test_enabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("RESULTS_BROWSER", raising=False)
+
+        assert scrape._results_browser() is not None
+
+    @pytest.mark.parametrize("value", ["0", "false", "no"])
+    def test_can_be_turned_off(self, monkeypatch, value):
+        monkeypatch.setenv("RESULTS_BROWSER", value)
+
+        assert scrape._results_browser() is None
+
+    def test_main_closes_the_session_even_when_the_run_fails(self, monkeypatch):
+        closed = []
+
+        class _Session:
+            def close(self):
+                closed.append(True)
+
+        monkeypatch.setattr(scrape, "_results_browser", lambda: _Session())
+
+        def explode(holder):
+            holder.append(scrape._results_browser())
+            raise RuntimeError("scrape blew up")
+
+        monkeypatch.setattr(scrape, "_run", explode)
+
+        with pytest.raises(RuntimeError, match="scrape blew up"):
+            scrape.main()
+        assert closed == [True]

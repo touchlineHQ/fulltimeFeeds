@@ -29,6 +29,7 @@ from compliance import (
     safe_results,
     split_results,
 )
+from browser import BrowserSession, BrowserUnavailable, is_challenge_page
 from index import write_index
 
 logging.basicConfig(
@@ -188,11 +189,6 @@ def _fetch_page(url: str, label: str) -> str:
     raise last_err  # type: ignore[misc]
 
 
-def _is_challenge_page(html: str) -> bool:
-    """True when a 200 response is really a WAF interstitial rather than data."""
-    return "attention required" in html[:4000].lower()
-
-
 def fetch_fixtures(season_id: str, league_name: str) -> list[Fixture]:
     """Fetch all upcoming fixtures for a given season/league."""
     url = f"{FIXTURES_URL}?selectedSeason={season_id}&selectedFixtureGroupKey="
@@ -291,27 +287,60 @@ class ResultsUnavailable(Exception):
     """
 
 
-def fetch_results(season_id: str, league_name: str) -> list[Result]:
+def fetch_results(
+    season_id: str,
+    league_name: str,
+    browser: BrowserSession | None = None,
+) -> list[Result]:
     """Fetch all results for a given season/league.
 
-    Raises ResultsUnavailable when Full-Time refuses the page.  A headless
-    browser is not tried: Chromium receives the same challenge page as a plain
-    fetch, so rendering only costs a browser launch per league per run.
+    The plain fetch is tried first: it is cheap, and it succeeds outright
+    whenever the client is not being challenged — with FULLTIME_COOKIE set, for
+    instance.  Only when it is refused does *browser* get used, which is why the
+    session is started lazily; a run that never needs it never launches one.
+
+    Raises ResultsUnavailable when both are refused, so an empty results array
+    can be published as "withheld from us" rather than "nobody played".
     """
     url = f"{RESULTS_URL}?selectedSeason={season_id}&selectedFixtureGroupKey="
     label = f"results/{league_name}"
     log.info(f"Fetching results for {league_name} ...")
 
+    refusal = ""
     try:
         html = _fetch_page(url, label)
     except Exception as e:
-        raise ResultsUnavailable(f"{league_name}: results page refused ({e})") from e
+        refusal = str(e)
+        html = ""
 
-    if _is_challenge_page(html):
-        raise ResultsUnavailable(f"{league_name}: results page returned a challenge page")
+    if html and not is_challenge_page(html):
+        log.debug(f"Results HTML length: {len(html)}, tables: {html.count('<table')}")
+        # A page that answers with no rows is a league that has not played yet,
+        # which is not the same as one we were refused.
+        return parse_results(html)
 
-    log.debug(f"Results HTML length: {len(html)}, tables: {html.count('<table')}")
-    return parse_results(html)
+    if browser is None:
+        raise ResultsUnavailable(
+            f"{league_name}: results page refused ({refusal or 'challenge page'}) "
+            f"and no browser session available"
+        )
+
+    log.info(f"  {label}: refused a plain fetch — retrying through the browser")
+    try:
+        rendered = browser.fetch(url, wait_selector="td.home-team")
+    except BrowserUnavailable as e:
+        raise ResultsUnavailable(f"{league_name}: no browser to retry with ({e})") from e
+    except Exception as e:
+        raise ResultsUnavailable(f"{league_name}: browser fetch failed ({e})") from e
+
+    if not rendered or is_challenge_page(rendered):
+        raise ResultsUnavailable(
+            f"{league_name}: results page challenged the browser too"
+        )
+
+    results = parse_results(rendered)
+    log.info(f"  {label}: {len(results)} result(s) via the browser")
+    return results
 
 
 def _find_fixture_table(soup: BeautifulSoup, context: str) -> object | None:
@@ -1536,9 +1565,23 @@ def restore_league_from_bucket(league_name: str, league_slug: str) -> int:
     return restored
 
 
-def main() -> int:
+# Set RESULTS_BROWSER=0 to keep the run to plain fetches — useful when a
+# cookie is doing the job, or to see what a run looks like without a browser.
+def _results_browser() -> BrowserSession | None:
+    if os.environ.get("RESULTS_BROWSER", "1").strip() in ("0", "false", "no"):
+        log.info("RESULTS_BROWSER disabled — results limited to plain fetches")
+        return None
+    return BrowserSession()
+
+
+def _run(browser_holder: list) -> int:
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     total_teams = 0
+    # Not started here: BrowserSession starts on first use, so a run whose
+    # plain fetches all succeed never launches a browser.
+    browser = _results_browser()
+    if browser is not None:
+        browser_holder.append(browser)
 
     # league slug -> True when this run had to fall back to previously
     # published data instead of scraping fresh (surfaced in index.json).
@@ -1562,7 +1605,7 @@ def main() -> int:
 
         results_unavailable = False
         try:
-            results = fetch_results(season_id, league_name)
+            results = fetch_results(season_id, league_name, browser=browser)
         except ResultsUnavailable as e:
             log.error(
                 f"RESULTS UNAVAILABLE — {e}. Feeds for this league will say so; "
@@ -1714,6 +1757,16 @@ def main() -> int:
         )
         return 1
     return 0
+
+
+def main() -> int:
+    """Run the scrape, making sure any browser it started is shut down."""
+    browser_holder: list[BrowserSession] = []
+    try:
+        return _run(browser_holder)
+    finally:
+        for session in browser_holder:
+            session.close()
 
 
 if __name__ == "__main__":
