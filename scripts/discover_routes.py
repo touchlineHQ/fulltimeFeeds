@@ -86,14 +86,27 @@ def main() -> int:
     ap.add_argument("--page", default="/tmp/fulltime-diagnosis/fixtures.html",
                     help="the saved fixtures page to mine")
     ap.add_argument("--probe", type=int, default=8, help="how many routes to try")
+    ap.add_argument("--season", default="918978398", help="selectedSeason ID, if fetching")
     args = ap.parse_args()
 
     page = pathlib.Path(args.page)
-    if not page.is_file():
-        print(f"No saved page at {page} — run diagnose_results.py first.")
-        return 1
-
-    html = page.read_text(encoding="utf-8", errors="replace")
+    if page.is_file():
+        html = page.read_text(encoding="utf-8", errors="replace")
+        print(f"Mining saved page {page} ({len(html):,} bytes)")
+    else:
+        # A --rm container throws its /tmp away, so a page saved by an earlier
+        # run is gone by the time this one starts. Fetch it rather than send
+        # anyone back a step; the fixtures page is the one that answers.
+        url = f"{scrape.FIXTURES_URL}?selectedSeason={args.season}&selectedFixtureGroupKey="
+        print(f"No saved page at {page} — fetching the fixtures page instead")
+        try:
+            html = scrape._fetch_page(url, "fixtures")
+        except Exception as e:
+            print(f"  fixtures fetch FAILED: {e!r}")
+            return 1
+        page.parent.mkdir(parents=True, exist_ok=True)
+        page.write_text(html, encoding="utf-8")
+        print(f"  saved {page} ({len(html):,} bytes)")
     counts, examples = routes_in(html)
 
     print(f"=== routes linked from {page.name} ({len(counts)} distinct) ===")
