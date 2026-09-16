@@ -269,20 +269,26 @@ and refresh the cookie when Cloudflare expires it. Feeds carry
 `results_unavailable` on any run where it has expired, so a stale cookie shows
 up as a flagged feed rather than silently empty results.
 
-To try the one mode that is not a browser Playwright launched — attaching to an
-ordinary browser you started yourself — use the launcher, which finds whichever
-Chrome-family browser is installed rather than assuming a name:
+What every refused mode has in common is that Playwright launched the browser,
+and a launched browser says so — measured on the same binary:
+
+| | `navigator.webdriver` |
+|---|---|
+| Playwright launched it | `true` |
+| Started directly, attached over CDP | `false` |
+
+So the probe also starts the bundled Chromium itself and attaches to it, which
+needs no browser on the host and works on a headless server:
 
 ```bash
-./scripts/start_browser.sh          # starts it, or reports one already running
-# load the results page in that window once, by hand
-docker run --rm --network=host -v "$PWD/scripts:/app/scripts" \
+docker run --rm -v "$PWD/scripts:/app/scripts" \
     yel-scraper:latest python scripts/probe_browser_modes.py
 ```
 
-`--network=host` lets the container reach the browser's debugging port on
-localhost, so nothing needs installing outside Docker. `./scripts/start_browser.sh --stop`
-when finished.
+On a desktop, `./scripts/start_browser.sh` starts whichever Chrome-family
+browser is installed with a debugging port, and the probe attaches to that
+instead when run with `docker run --network=host ...` so the container can
+reach it (`--stop` when finished).
 
 `scripts/probe_browser_modes.py` re-checks which automated modes are accepted,
 and `scripts/probe_alt_host.py` looks at `full-time.thefa.com` — the other

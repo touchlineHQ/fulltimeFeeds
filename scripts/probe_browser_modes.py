@@ -140,6 +140,61 @@ def via_curl(url: str, cookies: list[dict] | None = None) -> str:
         return verdict(resp.text)
 
 
+def via_own_launch(url: str, port: int = 9223):
+    """Start a stock browser ourselves, then attach — no host browser needed.
+
+    This is the launched/attached distinction tested without installing
+    anything: Playwright's own launch adds --enable-automation and sets
+    navigator.webdriver, so a page can see it is automated. Starting the same
+    bundled binary directly and attaching over CDP leaves those alone — it is a
+    stock browser, driven from outside.
+
+    Useful on a headless server, where there is no browser to attach to.
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as pw:
+        executable = pw.chromium.executable_path
+
+    if not pathlib.Path(executable).exists():
+        # Playwright names the build it expects; an image carrying a different
+        # one still has a perfectly good browser sitting next to it.
+        root = pathlib.Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+                            or pathlib.Path.home() / ".cache/ms-playwright")
+        found = sorted(root.glob("chromium-*/chrome-linux*/chrome")) if root.is_dir() else []
+        if not found:
+            return f"no chromium binary found (looked for {executable})", []
+        executable = str(found[-1])
+
+    proc = subprocess.Popen(
+        [
+            executable,
+            f"--remote-debugging-port={port}",
+            "--user-data-dir=/tmp/fulltime-own-launch",
+            "--no-first-run", "--no-default-browser-check",
+            "--no-sandbox", "--disable-dev-shm-usage",
+        ],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        endpoint = f"http://localhost:{port}"
+        for _ in range(40):                    # up to 20s for the port to open
+            try:
+                import urllib.request
+                urllib.request.urlopen(f"{endpoint}/json/version", timeout=2).read()
+                break
+            except Exception:
+                if proc.poll() is not None:
+                    return "browser exited before its debugging port opened", []
+                time.sleep(0.5)
+        else:
+            return "debugging port never opened", []
+
+        return via_cdp(url, endpoint)
+    finally:
+        proc.terminate()
+
+
 def via_cdp(url: str, endpoint: str):
     """Drive a browser that is ALREADY running, rather than launching one.
 
@@ -253,6 +308,10 @@ def main() -> int:
             lambda: via_browser(url, headless=False, channel="chrome", profile=args.profile))
     else:
         print("--- headed modes skipped: no DISPLAY\n")
+
+    if display:
+        run("start a stock browser myself, then attach (no host browser needed)",
+            lambda: via_own_launch(url))
 
     run(f"attach to a browser already running at {args.cdp}",
         lambda: via_cdp(url, args.cdp))
