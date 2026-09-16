@@ -202,9 +202,23 @@ fi
 AUTOSAVE_STATE="off (VNC_AUTOSAVE=0) — save by hand with Ctrl+S into $SAVE_DIR"
 if [ "${VNC_AUTOSAVE:-1}" != "0" ] && [ -z "${BROWSER_FAILED:-}" ]; then
     AUTOSAVE_STATE="into $SAVE_DIR as each tab finishes loading"
-    RESULTS_HTML_DIR="$SAVE_DIR" python3 "$(dirname "$0")/save_open_tabs.py" \
-        --endpoint "http://localhost:$CDP_PORT" --watch \
-        || echo "Tab saving stopped; the session is unaffected." >&2 &
+    # -u because a background process's output is block-buffered, and
+    # </dev/null because one inheriting the terminal can be stopped the moment
+    # it reads from it. Either would look like a process that hangs silently.
+    RESULTS_HTML_DIR="$SAVE_DIR" python3 -u "$(dirname "$0")/save_open_tabs.py" \
+        --endpoint "http://localhost:$CDP_PORT" --watch </dev/null 2>&1 \
+        | tee /tmp/save_open_tabs.log &
+    SAVER_PID=$!
+
+    (
+        sleep 20
+        if [ ! -s /tmp/save_open_tabs.log ]; then
+            echo >&2
+            echo "The tab saver has printed nothing in 20s. Run it by hand in the" >&2
+            echo "terminal inside the VNC session to see where it stops:" >&2
+            echo "  python3 -u /app/scripts/save_open_tabs.py --endpoint http://localhost:$CDP_PORT" >&2
+        fi
+    ) &
 fi
 
 cat <<EOF

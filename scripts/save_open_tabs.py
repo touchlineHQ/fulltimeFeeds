@@ -58,14 +58,17 @@ def _connected(endpoint: str):
             pass
         _disconnect()
 
+    log.info(f"  starting the playwright driver ...")
     from playwright.sync_api import sync_playwright
 
     pw = sync_playwright().start()
+    log.info(f"  driver up; attaching to the browser at {endpoint} ...")
     try:
         browser = pw.chromium.connect_over_cdp(endpoint, timeout=15_000)
     except Exception:
         pw.stop()
         raise
+    log.info(f"  attached ({len(browser.contexts)} context(s))")
     _connection = (pw, browser)
     return browser
 
@@ -189,6 +192,7 @@ def main() -> int:
 
     saved: set[str] = set()
     total_leagues = len(scrape.LEAGUES)
+    log.info(f"Watching for {total_leagues} league(s) at {args.endpoint}")
 
     try:
         while True:
