@@ -79,6 +79,10 @@ done
 
 cleanup() { kill $(jobs -p) 2>/dev/null || true; }
 trap cleanup EXIT
+# As PID 1 in a container, a shell gets no default signal disposition: SIGINT is
+# ignored unless something is explicitly listening, so Ctrl-C does nothing at
+# all. Handling it here is what makes the instruction to press it true.
+trap 'echo; echo "Shutting down ..."; exit 130' INT TERM
 
 Xvfb :99 -screen 0 "$SCREEN" -nolisten tcp >/dev/null 2>&1 &
 for _ in $(seq 1 50); do [ -e /tmp/.X11-unix/X99 ] && break; sleep 0.1; done

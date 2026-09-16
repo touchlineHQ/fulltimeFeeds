@@ -132,3 +132,35 @@ class TestSavedPagesFeedTheScraper:
 
         assert found is not None
         assert len(scrape.parse_results(found[0])) == 2
+
+
+class TestIdleReporting:
+    """Silence and "nothing happening yet" must not look the same."""
+
+    def test_idle_says_how_many_tabs_are_open(self, module, caplog):
+        module["_last_status"] = 0.0
+
+        with caplog.at_level("INFO", logger="save_open_tabs"):
+            module["_report_idle"](7)
+
+        assert "7 tab(s) open" in caplog.text
+
+    def test_idle_with_no_tabs_says_so(self, module, caplog):
+        module["_last_status"] = 0.0
+
+        with caplog.at_level("INFO", logger="save_open_tabs"):
+            module["_report_idle"](0)
+
+        assert "no tabs open" in caplog.text
+
+    def test_it_does_not_repeat_every_pass(self, module, caplog):
+        # At a five second poll this would be twelve lines a minute saying
+        # nothing new.
+        module["_last_status"] = 0.0
+
+        with caplog.at_level("INFO", logger="save_open_tabs"):
+            module["_report_idle"](7)
+            module["_report_idle"](7)
+            module["_report_idle"](7)
+
+        assert caplog.text.count("tab(s) open") == 1

@@ -30,6 +30,10 @@ log = logging.getLogger("save_open_tabs")
 
 SEASON_RE = re.compile(r"selectedSeason=(\d+)")
 ROW_MARKER = "home-team"
+# How often to say what is going on when nothing is ready. Silence and "still
+# starting up" look identical otherwise.
+STATUS_EVERY = 30.0
+_last_status = 0.0
 
 
 def league_names() -> dict[str, str]:
@@ -62,10 +66,27 @@ def open_results_tabs(endpoint: str) -> list[tuple[str, str, str]]:
                     log.debug(f"  could not read {url}: {e}")
                     continue
                 found.append((season.group(1), url, html))
+
+        if not found:
+            _report_idle(sum(len(c.pages) for c in browser.contexts))
         browser.close()
     finally:
         pw.stop()
     return found
+
+
+def _report_idle(open_tabs: int) -> None:
+    """Say why nothing is being saved, occasionally rather than every pass."""
+    global _last_status
+    now = time.time()
+    if now - _last_status < STATUS_EVERY:
+        return
+    _last_status = now
+    if open_tabs:
+        log.info(f"  waiting — {open_tabs} tab(s) open, none of them a loaded "
+                 f"results page yet")
+    else:
+        log.info("  waiting — no tabs open in the browser yet")
 
 
 def save_ready_tabs(endpoint: str, out_dir: pathlib.Path, saved: set[str]) -> int:
