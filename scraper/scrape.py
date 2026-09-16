@@ -1580,12 +1580,52 @@ def restore_league_from_bucket(league_name: str, league_slug: str) -> int:
     return restored
 
 
+def _load_results_session(spec: str):
+    """Build the results session named by RESULTS_SESSION ("module:attribute").
+
+    The bundled BrowserSession is refused by Full-Time's challenge, and closing
+    that gap means defeating the detection rather than working with it — which
+    this project does not do.  Supplying your own fetcher is the supported way
+    to make that choice yourself, and it keeps it in your module rather than in
+    a fork of this one.
+
+    Anything satisfying this protocol works::
+
+        class MySession:
+            # Return the page's HTML, or an interstitial if refused.
+            def fetch(self, url, wait_selector=None) -> str: ...
+
+            # Release whatever the session holds. Always called, even when the
+            # run raises.
+            def close(self) -> None: ...
+
+    An optional ``fetches`` counter, if present, is reported in the run summary.
+    Raise anything from ``fetch()`` and the league is published as
+    ``results_unavailable``, exactly as a refusal from the bundled session is.
+    """
+    module_name, _, attribute = spec.partition(":")
+    if not module_name or not attribute:
+        raise ValueError(
+            f"RESULTS_SESSION must look like 'module:attribute', got {spec!r}"
+        )
+    import importlib
+
+    module = importlib.import_module(module_name)
+    return getattr(module, attribute)()
+
+
 # Set RESULTS_BROWSER=0 to keep the run to plain fetches — useful when a
 # cookie is doing the job, or to see what a run looks like without a browser.
-def _results_browser() -> BrowserSession | None:
+def _results_browser():
     if os.environ.get("RESULTS_BROWSER", "1").strip() in ("0", "false", "no"):
         log.info("RESULTS_BROWSER disabled — results limited to plain fetches")
         return None
+
+    spec = os.environ.get("RESULTS_SESSION", "").strip()
+    if spec:
+        log.info(f"Using results session from {spec}")
+        return _load_results_session(spec)
+
     return BrowserSession()
 
 
@@ -1624,10 +1664,13 @@ def _run(browser_holder: list) -> int:
             fixtures = []
 
         results_unavailable = False
-        browser_fetches_before = browser.fetches if browser else 0
+        browser_fetches_before = getattr(browser, "fetches", 0) if browser else 0
         try:
             results = fetch_results(season_id, league_name, browser=browser)
-            used_browser = bool(browser) and browser.fetches > browser_fetches_before
+            used_browser = (
+                bool(browser)
+                and getattr(browser, "fetches", 0) > browser_fetches_before
+            )
             results_report.append((
                 league_name,
                 f"{len(results)} via {'the browser' if used_browser else 'a plain fetch'}"

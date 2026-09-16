@@ -1188,3 +1188,95 @@ class TestFetchPageRetries:
 
         assert scrape._fetch_page("https://example.test/f", "fixtures") == "rows"
         assert len(attempts) == 1
+
+
+# ---------------------------------------------------------------------------
+# RESULTS_SESSION — supplying your own fetcher
+# ---------------------------------------------------------------------------
+
+class _CustomSession:
+    """A stand-in for a user-supplied fetcher, with no `fetches` counter."""
+
+    built = 0
+
+    def __init__(self):
+        type(self).built += 1
+        self.urls = []
+
+    def fetch(self, url, wait_selector=None):
+        self.urls.append(url)
+        return ROWS
+
+    def close(self):
+        pass
+
+
+class TestResultsSessionPlugin:
+
+    def test_named_session_is_built_instead_of_the_bundled_one(self, monkeypatch):
+        monkeypatch.setenv("RESULTS_SESSION", f"{__name__}:_CustomSession")
+        before = _CustomSession.built
+
+        session = scrape._results_browser()
+
+        assert isinstance(session, _CustomSession)
+        assert _CustomSession.built == before + 1
+
+    def test_bundled_session_is_the_default(self, monkeypatch):
+        monkeypatch.delenv("RESULTS_SESSION", raising=False)
+        monkeypatch.delenv("RESULTS_BROWSER", raising=False)
+
+        from browser import BrowserSession
+
+        assert isinstance(scrape._results_browser(), BrowserSession)
+
+    def test_turning_the_browser_off_beats_a_named_session(self, monkeypatch):
+        monkeypatch.setenv("RESULTS_SESSION", f"{__name__}:_CustomSession")
+        monkeypatch.setenv("RESULTS_BROWSER", "0")
+
+        assert scrape._results_browser() is None
+
+    @pytest.mark.parametrize("spec", ["nocolon", ":missing_module", "module:"])
+    def test_a_malformed_spec_is_rejected_clearly(self, spec):
+        with pytest.raises(ValueError, match="module:attribute"):
+            scrape._load_results_session(spec)
+
+    def test_a_session_without_a_fetches_counter_still_works(self, monkeypatch):
+        # The counter is only used for the run summary; requiring it would make
+        # the protocol harder to satisfy than it needs to be.
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: [scrape.Result("12/09/26", "15:00", "A", "B", 1, 0, "G", "D")],
+        )
+        session = _CustomSession()
+
+        results = scrape.fetch_results("123", "League A", browser=session)
+
+        assert len(results) == 1
+        assert not hasattr(session, "fetches")
+
+    def test_main_reports_a_custom_session_without_a_counter(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        monkeypatch.setattr(scrape, "OUTPUT_DIR", tmp_path / "calendars")
+        monkeypatch.setattr(scrape, "LEAGUES", [("111", "League A")])
+        monkeypatch.setattr(scrape, "_results_browser", lambda: _CustomSession())
+        monkeypatch.setattr(
+            scrape, "fetch_fixtures",
+            lambda season, league: [
+                Fixture("11/10/26", "15:00", "Arnold Town", "Cotgrave", "G", "Division One")
+            ],
+        )
+        monkeypatch.setattr(
+            scrape, "fetch_results",
+            lambda season, league, browser=None: [
+                scrape.Result("12/09/26", "15:00", "Arnold Town", "Cotgrave",
+                              2, 1, "G", "Division One")
+            ],
+        )
+
+        assert scrape.main() == 0
+        payload = json.loads(
+            (tmp_path / "feeds" / "league-a" / "results.json").read_text(encoding="utf-8")
+        )
+        assert len(payload["results"]) == 1

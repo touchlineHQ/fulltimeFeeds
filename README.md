@@ -299,9 +299,40 @@ Set `RESULTS_BROWSER=0` to keep a run to plain fetches only. If the browser is
 challenged too, `ResultsUnavailable` is raised as before and the feeds carry
 `results_unavailable`.
 
-A containerised browser is not identical to a desktop one — it renders through
-SwiftShader and carries a slim image's font set — so this may or may not be
-accepted. It is not tuned to hide those differences.
+Measured against the live site, that bundled browser is challenged too, from the
+same public IP as a phone that loads the page fine. What is left is that
+attaching over CDP is itself detectable — driving a page enables the debug
+protocol, and that is what the remaining detection keys on. Closing it means
+defeating the detection rather than working with it, which this project does
+not do.
+
+### Supplying your own results fetcher
+
+If you want to make that call yourself, `RESULTS_SESSION` takes any fetcher,
+so it lives in your module rather than a fork of this one:
+
+```bash
+export RESULTS_SESSION="my_fetcher:Session"
+```
+
+```python
+# my_fetcher.py
+class Session:
+    def fetch(self, url, wait_selector=None) -> str:
+        """Return the page's HTML, or an interstitial if refused."""
+
+    def close(self) -> None:
+        """Release what the session holds. Always called, even on a crash."""
+```
+
+An optional `fetches` counter is reported in the run summary if present.
+Anything raised from `fetch()` publishes that league as `results_unavailable`,
+exactly as a refusal from the bundled session does — so a fetcher that stops
+working degrades into a flagged feed rather than a silent one.
+
+`scripts/try_results.py` exercises one league through the real path, which is
+the quickest way to test a fetcher without a full run.
+
 
 `scripts/probe_browser_modes.py` re-checks which automated modes are accepted,
 and on a desktop `./scripts/start_browser.sh` starts a browser with a debugging
