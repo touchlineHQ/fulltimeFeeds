@@ -5,10 +5,13 @@ FROM python:3.12-slim
 # xvfb + xauth let a headed browser run in the container: Cloudflare challenges
 # headless Chromium on the pages carrying scores, so results need a real
 # browser session rather than a headless one.
+# x11vnc serves the virtual display over VNC, so a headless server can still
+# have a browser someone drives by hand — see scripts/vnc_browser.sh.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     xvfb \
     xauth \
+    x11vnc \
     && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory inside the container

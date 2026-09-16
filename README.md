@@ -306,6 +306,26 @@ protocol, and that is what the remaining detection keys on. Closing it means
 defeating the detection rather than working with it, which this project does
 not do.
 
+### A browser on the server
+
+The scraper runs headless, so there is no browser on it to open a page in or
+use developer tools with. `scripts/vnc_browser.sh` starts one on a virtual
+display and serves it over VNC, so it can be driven from a laptop or phone on
+the same network:
+
+```bash
+echo 'VNC_PASSWORD=something' >> .env
+docker compose run --rm --service-ports scraper scripts/vnc_browser.sh
+# then point a VNC client at <this-host>:5900
+```
+
+The profile lives in the `scraper_state` volume, so whatever is done in it
+persists between runs. A password is required: this puts a browser on your
+network, and an unauthenticated one is a browser anybody on that network can
+drive. Bind it to localhost and tunnel over SSH if the network is not one you
+control.
+
+
 ### Supplying your own results fetcher
 
 If you want to make that call yourself, `RESULTS_SESSION` takes any fetcher,
