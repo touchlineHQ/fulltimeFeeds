@@ -8,6 +8,11 @@ services:
     # Automatically injects all variables found in your local .env file
     env_file:
       - .env
+    # Chromium keeps renderer shared memory in /dev/shm, and Docker's 64MB
+    # default is too small for a page this size — the tab dies rather than
+    # renders. Raising it beats --disable-dev-shm-usage, which trades the crash
+    # for slow, flaky rendering.
+    shm_size: 1gb
     # Persist published feeds/calendars across runs so a league that fails to
     # fetch one run keeps its previously published data (and stays in index.json).
     volumes:
