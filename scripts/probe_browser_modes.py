@@ -100,6 +100,43 @@ def via_curl(url: str, cookies: list[dict] | None = None) -> str:
         return verdict(resp.text)
 
 
+def via_cdp(url: str, endpoint: str):
+    """Drive a browser that is ALREADY running, rather than launching one.
+
+    Every launched mode is refused, and launching is the thing they have in
+    common: Playwright starts a browser with --enable-automation and sets
+    navigator.webdriver. Attaching to a browser you started yourself does
+    neither — it is the same session you read the page in by hand.
+
+    Start one first:
+
+        google-chrome --remote-debugging-port=9222 \
+            --user-data-dir="$HOME/.fulltime-chrome"
+
+    Visit the results page in it once, so anything Cloudflare wants to set is
+    set, then run this.
+    """
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.connect_over_cdp(endpoint)
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+            try:
+                page.wait_for_selector(ROW_SELECTOR, timeout=SETTLE_MS)
+            except PWTimeout:
+                pass
+            html = page.content()
+            cookies = context.cookies()
+        finally:
+            # Close only the tab we opened; the browser is the operator's.
+            page.close()
+
+    return verdict(html), cookies
+
+
 def via_browser(url: str, *, headless, channel=None, profile=None, args=None):
     """Return (verdict, cookies). Cookies come back so they can be replayed."""
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -140,6 +177,8 @@ def main() -> int:
     ap.add_argument("--season", default=DEFAULT_SEASON)
     ap.add_argument("--profile", default="/tmp/fulltime-profile",
                     help="persistent browser profile directory")
+    ap.add_argument("--cdp", default="http://localhost:9222",
+                    help="a browser you started yourself, with --remote-debugging-port")
     args = ap.parse_args()
 
     url = f"{scrape.RESULTS_URL}?selectedSeason={args.season}&selectedFixtureGroupKey="
@@ -182,6 +221,9 @@ def main() -> int:
             lambda: via_browser(url, headless=False, channel="chrome", profile=args.profile))
     else:
         print("--- headed modes skipped: no DISPLAY\n")
+
+    run(f"attach to a browser already running at {args.cdp}",
+        lambda: via_cdp(url, args.cdp))
 
     if good_cookies:
         names = sorted({c["name"] for c in good_cookies})
