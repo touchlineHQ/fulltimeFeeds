@@ -150,13 +150,6 @@ def _fetch_page(url: str, label: str) -> str:
     raise last_err  # type: ignore[misc]
 
 
-def fetch_fixtures(season_id: str, league_name: str) -> list[Fixture]:
-    """Fetch all upcoming fixtures for a given season/league."""
-    url = f"{FIXTURES_URL}?selectedSeason={season_id}&selectedFixtureGroupKey="
-    log.info(f"Fetching fixtures for {league_name} ...")
-    return parse_fixtures(_fetch_page(url, f"fixtures/{league_name}"))
-
-
 def _fetch_page_js(url: str, label: str) -> str:
     """Fetch a JavaScript-rendered page using Playwright (headless Chromium).
 
@@ -231,16 +224,134 @@ def _fetch_page_js(url: str, label: str) -> str:
     return ""
 
 
+def _fixtures_url(season_id: str) -> str:
+    """Full-Time's fixture list for a whole season."""
+    return f"{FIXTURES_URL}?selectedSeason={season_id}&selectedFixtureGroupKey="
+
+
+def _results_url(season_id: str, date_code: str = "all") -> str:
+    """Full-Time's results page for a whole season.
+
+    The results page filters by date.  Asked for without a
+    ``selectedDateCode`` it answers for one period only — often one that has
+    no matches in it — which is how a season full of played matches comes back
+    as an empty results list.  ``all`` asks for the season.
+    """
+    params = [f"selectedSeason={season_id}"]
+    if date_code:
+        params.append(f"selectedDateCode={date_code}")
+    params += [
+        "selectedFixtureGroupAgeGroupId=",
+        "selectedFixtureGroupKey=",
+        "selectedRelation=",
+        "selectedClub=",
+        "selectedTeam=",
+    ]
+    return f"{RESULTS_URL}?" + "&".join(params)
+
+
+def fetch_fixtures(season_id: str, league_name: str) -> tuple[list[Fixture], list[Result]]:
+    """Fetch a season's fixture list, split into (still to come, already played).
+
+    Full-Time leaves a played match on the fixture list until its league
+    enters the result, and at U11 and below — where no result is ever
+    published — some leagues never do.  Such a row still carries a score
+    ("3 - 1", or "X - X" where the score is withheld), so it comes back as a
+    result rather than being advertised as an upcoming match for the rest of
+    the season.
+    """
+    url = _fixtures_url(season_id)
+    label = f"fixtures/{league_name}"
+    log.info(f"Fetching fixtures for {league_name} ...")
+
+    fixtures, played = parse_fixtures_page(_fetch_page(url, label))
+    if not fixtures and not played:
+        log.warning(f"  {league_name}: no fixture rows in the static page — retrying in a browser")
+        fixtures, played = parse_fixtures_page(_fetch_page_js(url, label))
+
+    log.info(f"  Found {len(fixtures)} fixtures ({len(played)} already played)")
+    return fixtures, played
+
+
 def fetch_results(season_id: str, league_name: str) -> list[Result]:
-    """Fetch all results for a given season/league."""
-    url = f"{RESULTS_URL}?selectedSeason={season_id}&selectedFixtureGroupKey="
+    """Fetch a season's results, trying each way the page will give them up.
+
+    Cheapest first: the whole-season URL fetched statically, then the bare URL
+    without a date filter, then a real browser.  Full-Time renders some pages
+    client-side, and a static fetch of one of those is not an error — it is a
+    page with no match rows in it at all, which is indistinguishable from a
+    league that has not played yet unless something else is tried.
+    """
+    label = f"results/{league_name}"
     log.info(f"Fetching results for {league_name} ...")
-    html = _fetch_page(url, f"results/{league_name}")
-    log.debug(f"Results HTML length: {len(html)}, tables: {html.count('<table')}")
-    return parse_results(html)
+
+    attempts = (
+        ("whole-season URL", True, lambda: _fetch_page(_results_url(season_id), label)),
+        ("no date filter", True, lambda: _fetch_page(_results_url(season_id, date_code=""), label)),
+        ("browser render", False, lambda: _fetch_page_js(_results_url(season_id), label)),
+    )
+
+    static_fetch_failed = False
+    for description, is_static, fetch in attempts:
+        # A static fetch that failed outright failed at the transport — the WAF,
+        # or the network. Asking the same way again with a different query
+        # string only leans on a host that is already refusing us.
+        if is_static and static_fetch_failed:
+            log.debug(f"  {label}: skipping {description} — a static fetch already failed")
+            continue
+        try:
+            html = fetch()
+        except Exception as e:
+            static_fetch_failed = static_fetch_failed or is_static
+            log.warning(f"  {label}: {description} failed: {e}")
+            continue
+        log.debug(f"  {description}: {len(html)} bytes, {html.count('<table')} tables")
+        results = parse_results(html)
+        if results:
+            log.info(f"  {league_name}: {len(results)} results via {description}")
+            return results
+        log.warning(f"  {league_name}: no results via {description}")
+
+    log.error(f"  {league_name}: no results found by any method")
+    return []
 
 
-def _find_fixture_table(soup: BeautifulSoup, context: str) -> object | None:
+def merge_results(from_results_page: list[Result], from_fixture_list: list[Result]) -> list[Result]:
+    """Combine result rows from both pages, keeping one row per match.
+
+    The results page is authoritative — a row there has a confirmed score — so
+    rows recovered from the fixture list only fill matches it does not cover.
+    """
+    merged = list(from_results_page)
+    seen = {(r.date, r.home_team, r.away_team) for r in merged}
+    for result in from_fixture_list:
+        key = (result.date, result.home_team, result.away_team)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(result)
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+# Full-Time names the two team cells "home-team" and "road-team", sometimes
+# with a suffix ("home-team-col"), so both are matched on their prefix.
+_HOME_CELL_RE = re.compile(r"\bhome-team")
+_ROAD_CELL_RE = re.compile(r"\broad-team")
+
+# A header cell carries the column's label where a data row carries a team.
+_HEADER_LABELS = {"", "home team", "home", "away team", "road team", "away"}
+
+# Cells that name what they hold. The table layout labels neither, and is read
+# positionally instead — see _venue_and_competition.
+_VENUE_CLASS_RE = re.compile(r"venue|location|ground", re.IGNORECASE)
+_COMPETITION_CLASS_RE = re.compile(r"competition|division|league", re.IGNORECASE)
+
+
+def _find_fixture_table(soup: BeautifulSoup, context: str, warn: bool = True) -> object | None:
     """Return the first table containing fixture/result rows.
 
     Tries two strategies:
@@ -255,14 +366,256 @@ def _find_fixture_table(soup: BeautifulSoup, context: str) -> object | None:
             return t
     # Strategy 2: data rows
     for t in tables:
-        if t.find("td", class_="home-team"):
+        if t.find("td", class_=_HOME_CELL_RE):
             return t
-    log.warning(f"No fixture/result table found for {context} — page structure may have changed.")
+    if warn:
+        log.warning(f"No fixture/result table found for {context} — page structure may have changed.")
     return None
 
 
-def parse_fixtures(html: str) -> list[Fixture]:
-    """Parse the Full-Time fixtures table using CSS classes.
+def _is_header_cell(cell) -> bool:
+    """True when a cell holds a column label rather than a team name."""
+    return cell.get_text(strip=True).lower() in _HEADER_LABELS
+
+
+def _venue_and_competition(cells) -> tuple[str, str]:
+    """Split the cells following the away team into (venue, competition).
+
+    Full-Time's table labels neither cell, and orders them venue then
+    competition; the div layout labels both and orders them the other way
+    round.  Labelled cells are therefore read by name and the rest
+    positionally, so the division lands in `division` either way — which
+    matters beyond tidiness, because the division label is where a match's
+    age group is often the only thing that names it.
+    """
+    venue = ""
+    competition = ""
+    unlabelled: list[str] = []
+
+    for cell in cells:
+        classes = " ".join(cell.get("class", []))
+        if "status" in classes.lower():
+            break
+        text = cell.get_text(strip=True)
+        if not text:
+            continue
+        if _VENUE_CLASS_RE.search(classes):
+            venue = venue or text
+        elif _COMPETITION_CLASS_RE.search(classes):
+            competition = competition or text
+        else:
+            unlabelled.append(text)
+
+    for text in unlabelled:
+        if not venue:
+            venue = text
+        elif not competition:
+            competition = text
+        else:
+            break
+
+    return venue, competition
+
+
+def _trailing_cells(row, away_cell) -> list:
+    """The cells after the away team, which is where venue and competition sit.
+
+    They are siblings of the away cell in the table layout.  Where a layout
+    wraps the team name in something, the away cell has no siblings of its own
+    and the wrapper's are read instead, so a nested row still gets a division
+    rather than "Unknown Division".
+    """
+    cell = away_cell
+    while cell is not None and cell is not row:
+        siblings = cell.find_next_siblings()
+        if siblings:
+            return siblings
+        cell = cell.parent
+    return []
+
+
+def _row_date_time(row, home_cell) -> tuple[str, str]:
+    """Return (DD/MM/YY, HH:MM) for a match row, either part possibly empty.
+
+    The date sits before the home team, in a cell that may also hold the
+    kick-off time ("22/03/2610:00").  Cells before the home team are read
+    first so a date elsewhere in the row cannot win; the whole row is only
+    scanned when that finds nothing, for layouts that nest the two.
+    """
+    def _read(text: str) -> tuple[str, str] | None:
+        dm = re.search(r"(\d{2}/\d{2}/\d{2})", text)
+        if not dm:
+            return None
+        tm = re.search(r"(\d{1,2}:\d{2})", text)
+        return dm.group(1), tm.group(1) if tm else ""
+
+    cell = home_cell.find_previous_sibling(True)
+    while cell is not None:
+        found = _read(cell.get_text(strip=True))
+        if found:
+            return found
+        cell = cell.find_previous_sibling(True)
+
+    for cell in row.find_all(True):
+        found = _read(cell.get_text(strip=True))
+        if found:
+            return found
+
+    return "", ""
+
+
+_REDACTED_SCORE_RE = re.compile(r"\bX\s*[-–—]\s*X\b", re.IGNORECASE)
+_SCORE_RE = re.compile(r"(?<![0-9-])(\d{1,2})\s*[-–—]\s*(\d{1,2})(?![0-9])")
+
+
+def _read_score(text: str) -> tuple[int | None, int | None] | None:
+    """Read a score out of a cell's text.
+
+    Returns (int, int) for a score, (None, None) where it is withheld as
+    "X - X", and None where the text holds no score at all ("VS" on a match
+    still to be played).
+    """
+    if _REDACTED_SCORE_RE.search(text):
+        return (None, None)
+    m = _SCORE_RE.search(text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _cell_score(home_cell, away_cell) -> tuple[int | None, int | None] | None:
+    """Read the score from the dedicated score cell between the two teams.
+
+    Only a cell that says it is the score counts, so nothing else in the row —
+    a venue with a number in it, a season in a competition name — can be read
+    as one.
+    """
+    cell = home_cell.find_next_sibling(True)
+    while cell is not None and cell is not away_cell:
+        if any("score" in c for c in cell.get("class", [])):
+            score = _read_score(cell.get_text(strip=True))
+            if score is not None:
+                return score
+        cell = cell.find_next_sibling(True)
+    return None
+
+
+def _row_score(row, home_cell, away_cell) -> tuple[int | None, int | None] | None:
+    """Extract (home_score, away_score) from a match row.
+
+    Returns:
+      (int, int)      — numeric score found
+      (None, None)    — score is redacted (X-X)
+      None            — no score anywhere in the row (skip it — postponed, or
+                        a result the league has not entered)
+
+    Read in narrowing order of confidence: the score cell between the two
+    teams, then any cell in the row that says it is the score, then anything
+    at all sitting between the two teams.  The row is never searched beyond
+    that, because the cells outside it hold a venue and a competition name —
+    "Pitch 3-4" and "Div 1 (2025-26)" both read as scores otherwise, and an
+    upcoming fixture would vanish from the calendar as a match already played.
+
+    _SCORE_RE uses \\d{1,2} (1–2 digit numbers only) to avoid false matches on:
+      - season notation like '2025-26'
+      - pagination text like '1-100 of 2847'
+      - ISO-style dates like '2025-11-15'
+    Football scores for youth teams fit comfortably within 0-99.
+    Colon is excluded as a separator to avoid matching kick-off times.
+    """
+    # Preferred: the dedicated score cell between the two team cells.
+    score = _cell_score(home_cell, away_cell)
+    if score is not None:
+        return score
+
+    # Nested layouts put it elsewhere in the row, but still name it.
+    score_el = row.find(True, class_=re.compile(r"\bscore\b"))
+    if score_el is not None:
+        score = _read_score(score_el.get_text(strip=True))
+        if score is not None:
+            return score
+
+    # Last resort: anything between the two teams, named or not. The walk is
+    # bounded by the row so a page of two thousand matches is not re-scanned
+    # from each row to its end.
+    between = False
+    for el in row.find_all(True):
+        if el is away_cell:
+            break
+        if el is home_cell:
+            between = True
+            continue
+        if not between:
+            continue
+        score = _read_score(el.get_text(strip=True))
+        if score is not None:
+            return score
+
+    return None
+
+
+def _iter_match_cells(soup: BeautifulSoup, context: str):
+    """Yield (row, home_cell, away_cell) for every match on a Full-Time page.
+
+    Both pages normally render one <tr> per match, with the away cell a
+    sibling of the home cell.  The results page has also been seen rendering
+    each match as nested divs, where it is not, so each home cell is paired
+    with its own away cell by walking outwards to the tightest element that
+    contains exactly one.
+    """
+    table = _find_fixture_table(soup, context, warn=False)
+    if table is not None:
+        for row in table.find_all("tr"):
+            home_cell = row.find(True, class_=_HOME_CELL_RE)
+            away_cell = row.find(True, class_=_ROAD_CELL_RE)
+            if not home_cell or not away_cell:
+                continue
+            if _is_header_cell(home_cell) or _is_header_cell(away_cell):
+                continue
+            yield row, home_cell, away_cell
+        return
+
+    home_cells = [
+        cell for cell in soup.find_all(True, class_=_HOME_CELL_RE)
+        if not _is_header_cell(cell)
+    ]
+    if not home_cells:
+        log.warning(f"No fixture/result rows found for {context} — page structure may have changed.")
+        return
+
+    first = home_cells[0]
+    log.debug(
+        f"  First home cell: <{first.name} class={first.get('class')}> "
+        f"parent=<{first.parent.name}> text={first.get_text(strip=True)!r}"
+    )
+
+    for home_cell in home_cells:
+        row = home_cell.parent
+        away_cell = home_cell.find_next_sibling(True, class_=_ROAD_CELL_RE)
+
+        if not away_cell:
+            candidate = home_cell.parent
+            for _ in range(8):
+                if candidate is None:
+                    break
+                road_cells = candidate.find_all(True, class_=_ROAD_CELL_RE)
+                if len(road_cells) == 1:
+                    away_cell = road_cells[0]
+                    row = candidate
+                    break
+                if len(road_cells) > 1:
+                    # Ancestor has multiple rows — fall back to next-in-document
+                    away_cell = home_cell.find_next(True, class_=_ROAD_CELL_RE)
+                    break
+                candidate = getattr(candidate, "parent", None)
+
+        if not away_cell or _is_header_cell(away_cell):
+            continue
+        yield row, home_cell, away_cell
+
+
+def parse_fixtures_page(html: str) -> tuple[list[Fixture], list[Result]]:
+    """Parse the Full-Time fixtures table into (still to come, already played).
 
     Each data row has 10 cells:
       [0] type          (class: color-dark-grey bold cell-divider)
@@ -275,57 +628,30 @@ def parse_fixtures(html: str) -> list[Fixture]:
       [7] venue         (class: left cell-divider)
       [8] competition   (class: left cell-divider)
       [9] status        (class: status-notes)
+
+    Cell [4] is what separates the two lists: "VS" on a match still to be
+    played, a score on one the league has not moved to its results page yet.
+    Only that cell is read, so nothing else in the row can be mistaken for a
+    score and drop a real fixture out of the calendar.
     """
     soup = BeautifulSoup(html, "html.parser")
     fixtures: list[Fixture] = []
+    played: list[Result] = []
 
-    fixture_table = _find_fixture_table(soup, "fixtures")
-    if not fixture_table:
-        return []
-
-    # Parse data rows (skip header)
-    for row in fixture_table.find_all("tr")[1:]:
-        home_td = row.find("td", class_="home-team")
-        away_td = row.find("td", class_="road-team")
-        if not home_td or not away_td:
-            continue
-
-        home = clean_team_name(home_td.get_text(strip=True))
-        away = clean_team_name(away_td.get_text(strip=True))
+    for row, home_cell, away_cell in _iter_match_cells(soup, "fixtures"):
+        home = clean_team_name(home_cell.get_text(strip=True))
+        away = clean_team_name(away_cell.get_text(strip=True))
         if not home or not away:
             continue
 
-        # Date+time: find the first cell containing a date pattern (DD/MM/YY).
-        # Can't use class_="cell-divider" — the first cell-divider is the type
-        # cell ("L"), not the date cell. Scanning for the pattern is more robust.
-        date_str = ""
-        time_str = ""
-        for td in row.find_all("td"):
-            cell_text = td.get_text(strip=True)
-            dm = re.search(r"(\d{2}/\d{2}/\d{2})", cell_text)
-            if dm:
-                date_str = dm.group(1)
-                tm = re.search(r"(\d{1,2}:\d{2})", cell_text)
-                if tm:
-                    time_str = tm.group(1)
-                break
+        date_str, time_str = _row_date_time(row, home_cell)
+        if not date_str:
+            continue
 
-        # Venue and competition: cells after the away team
-        venue = ""
-        competition = ""
-        for td in away_td.find_next_siblings("td"):
-            classes = td.get("class", [])
-            if "status-notes" in classes:
-                break
-            text = td.get_text(strip=True)
-            if not text:
-                continue
-            if not venue:
-                venue = text
-            elif not competition:
-                competition = text
+        venue, competition = _venue_and_competition(_trailing_cells(row, away_cell))
+        score = _cell_score(home_cell, away_cell)
 
-        if date_str:
+        if score is None:
             fixtures.append(Fixture(
                 date=date_str,
                 time=time_str,
@@ -334,197 +660,55 @@ def parse_fixtures(html: str) -> list[Fixture]:
                 venue=venue,
                 division_label=competition or "Unknown Division",
             ))
+        else:
+            played.append(Result(
+                date=date_str,
+                time=time_str,
+                home_team=home,
+                away_team=away,
+                home_score=score[0],
+                away_score=score[1],
+                venue=venue,
+                division_label=competition or "Unknown Division",
+            ))
 
+    return fixtures, played
+
+
+def parse_fixtures(html: str) -> list[Fixture]:
+    """Parse the Full-Time fixtures table, returning matches still to be played."""
+    fixtures, _played = parse_fixtures_page(html)
     log.info(f"  Found {len(fixtures)} fixtures")
     return fixtures
-
-
-_REDACTED_SCORE_RE = re.compile(r"\bX\s*[-–—]\s*X\b", re.IGNORECASE)
-_SCORE_RE = re.compile(r"(?<![0-9-])(\d{1,2})\s*[-–—]\s*(\d{1,2})(?![0-9])")
-
-
-def _parse_score(row) -> tuple[int | None, int | None] | None:
-    """Extract (home_score, away_score) from a results row.
-
-    Returns:
-      (int, int)      — numeric score found
-      (None, None)    — score is redacted (X-X)
-      None            — no score element found at all (skip the row)
-
-    Uses \\d{1,2} (1–2 digit numbers only) to avoid false matches on:
-      - season notation like '2025-26'
-      - pagination text like '1-100 of 2847'
-      - ISO-style dates like '2025-11-15'
-    Football scores for youth teams fit comfortably within 0-99.
-    Colon is excluded as a separator to avoid matching kick-off times.
-    """
-    # Preferred: dedicated score element (class contains "score")
-    score_el = row.find(True, class_=re.compile(r"\bscore\b"))
-    if score_el:
-        text = score_el.get_text(strip=True)
-        if _REDACTED_SCORE_RE.search(text):
-            return (None, None)
-        m = _SCORE_RE.search(text)
-        if m:
-            return int(m.group(1)), int(m.group(2))
-
-    # Fallback: scan all descendant elements (dash only — no colon)
-    for el in row.find_all(True):
-        text = el.get_text(strip=True)
-        if _REDACTED_SCORE_RE.search(text):
-            return (None, None)
-        m = _SCORE_RE.search(text)
-        if m:
-            return int(m.group(1)), int(m.group(2))
-
-    return None
 
 
 def parse_results(html: str) -> list[Result]:
     """Parse the Full-Time results page.
 
-    The results page renders rows as <div> elements with classes like
-    "home-team-col" and "road-team-col".  Regex class matching picks up
-    all variations (home-team, home-team-col, etc.).
-    Header cells (text == "Home Team") are skipped automatically.
+    Normally the same table as the fixtures page; where it renders as nested
+    divs instead ("home-team-col" and friends) the rows are walked apart
+    instead.  Rows with no score at all are matches that were never played —
+    postponed, or awaiting entry — and are left out.
     """
     parser = "lxml" if _lxml_available() else "html.parser"
     log.info(f"  Parsing {len(html) // 1024}KB of results HTML with {parser} ...")
     soup = BeautifulSoup(html, parser)
 
-    # Match any element whose class list contains a token starting with "home-team"
-    home_cells = soup.find_all(True, class_=re.compile(r"\bhome-team"))
-    # Strip header cells — they contain exactly the label text, not a team name
-    home_cells = [
-        c for c in home_cells
-        if c.get_text(strip=True).lower() not in ("home team", "home", "")
-    ]
-    log.info(f"  home-team* elements (data rows): {len(home_cells)}")
-
-    if not home_cells:
-        idx = html.find("home-team")
-        context = html[max(0, idx - 100):idx + 100] if idx != -1 else "<not found>"
-        log.warning(f"  No home-team data cells found. Raw context: ...{context}...")
-        return []
-
-    first = home_cells[0]
-    log.info(
-        f"  First home cell: <{first.name} class={first.get('class')}> "
-        f"parent=<{first.parent.name}> text={first.get_text(strip=True)!r}"
-    )
-
     results: list[Result] = []
     seen: set[str] = set()
 
-    _road_re = re.compile(r"\broad-team")
-
-    for home_cell in home_cells:
-        away_cell = None
-        row = home_cell.parent  # default row context
-
-        # Strategy 1: road-team is a direct sibling (flat / single-level layout).
-        # find_next_sibling pairs the away cell for THIS row only.
-        sib = home_cell.find_next_sibling(True, class_=_road_re)
-        if sib:
-            away_cell = sib
-            # row stays as home_cell.parent (they share the same parent)
-
-        if not away_cell:
-            # Strategy 2: nested layout — walk up to the tightest ancestor that
-            # contains exactly one road-team element (the paired one).
-            candidate = home_cell.parent
-            for _ in range(8):
-                if candidate is None:
-                    break
-                road_cells = candidate.find_all(True, class_=_road_re)
-                if len(road_cells) == 1:
-                    away_cell = road_cells[0]
-                    row = candidate
-                    break
-                if len(road_cells) > 1:
-                    # Ancestor has multiple rows — fall back to next-in-document
-                    away_cell = home_cell.find_next(True, class_=_road_re)
-                    break
-                candidate = getattr(candidate, "parent", None)
-
-        if not away_cell:
-            continue
-        if away_cell.get_text(strip=True).lower() in ("away team", "road team", "away", ""):
-            continue
-
+    for row, home_cell, away_cell in _iter_match_cells(soup, "results"):
         home = clean_team_name(home_cell.get_text(strip=True))
         away = clean_team_name(away_cell.get_text(strip=True))
         if not home or not away:
             continue
 
-        # --- Score: look for a .score* sibling between home and away cells ---
-        # score is a (home, away) tuple where either value may be None (redacted).
-        # If score itself is None the match has no score element — skip it.
-        score: tuple[int | None, int | None] | None = None
-        el = home_cell.find_next_sibling(True)
-        while el and el is not away_cell:
-            if any("score" in c for c in el.get("class", [])):
-                text = el.get_text(strip=True)
-                if _REDACTED_SCORE_RE.search(text):
-                    score = (None, None)
-                    break
-                m = _SCORE_RE.search(text)
-                if m:
-                    score = (int(m.group(1)), int(m.group(2)))
-                    break
-            el = el.find_next_sibling(True)
-        if score is None:
-            # Nested layout fallback: search within the row container
-            score = _parse_score(row)
+        score = _row_score(row, home_cell, away_cell)
         if score is None:
             log.debug(f"No score for {home} v {away} — skipping (postponed?)")
             continue
-        home_score, away_score = score
 
-        # --- Date/time: look for a sibling before home_cell ---
-        date_str = ""
-        time_str = ""
-        el = home_cell.find_previous_sibling(True)
-        while el:
-            text = el.get_text(strip=True)
-            dm = re.search(r"(\d{2}/\d{2}/\d{2})", text)
-            if dm:
-                date_str = dm.group(1)
-                tm = re.search(r"(\d{1,2}:\d{2})", text)
-                if tm:
-                    time_str = tm.group(1)
-                break
-            el = el.find_previous_sibling(True)
-        if not date_str:
-            # Nested layout fallback: scan all descendants of row
-            for el in row.find_all(True):
-                text = el.get_text(strip=True)
-                dm = re.search(r"(\d{2}/\d{2}/\d{2})", text)
-                if dm:
-                    date_str = dm.group(1)
-                    tm = re.search(r"(\d{1,2}:\d{2})", text)
-                    if tm:
-                        time_str = tm.group(1)
-                    break
-
-        # --- Venue / competition: siblings after away_cell ---
-        # On the results page the competition/division label appears first,
-        # followed by the venue (which may be absent).
-        venue = ""
-        competition = ""
-        for el in away_cell.find_next_siblings():
-            classes = " ".join(el.get("class", []))
-            if "status" in classes:
-                break
-            text = el.get_text(strip=True)
-            if not text:
-                continue
-            if not competition:
-                competition = text
-            elif not venue:
-                venue = text
-                break
-
+        date_str, time_str = _row_date_time(row, home_cell)
         if not date_str:
             continue
 
@@ -533,13 +717,14 @@ def parse_results(html: str) -> list[Result]:
             continue
         seen.add(key)
 
+        venue, competition = _venue_and_competition(_trailing_cells(row, away_cell))
         results.append(Result(
             date=date_str,
             time=time_str,
             home_team=home,
             away_team=away,
-            home_score=home_score,
-            away_score=away_score,
+            home_score=score[0],
+            away_score=score[1],
             venue=venue,
             division_label=competition or "Unknown Division",
         ))
@@ -860,8 +1045,11 @@ def write_team_feed(
         d = result_to_dict(r)
         # `team` names the subject of the row. A participation record keeps it
         # and drops both team names, so without it a consumer cannot tell which
-        # side was ours and has to anonymise the match completely.
+        # side was ours and has to anonymise the match completely. `league`
+        # rides along for the same reason: a participation record built here
+        # would otherwise be the only one in a feed without it.
         d["team"] = team_name
+        d["league"] = league_name
         d["home_away"] = "home" if is_home else "away"
         d["opponent"] = r.away_team if is_home else r.home_team
         d["goals_for"] = r.home_score if is_home else r.away_score
@@ -1367,18 +1555,35 @@ def main() -> int:
     all_team_result_rows: list[dict] = []
     all_team_names: list[str] = []
 
+    # Leagues that gave up a fixture list but no results at all. Almost always
+    # a scraping fault rather than a league that has genuinely played nothing,
+    # and silent until it is said out loud: the feeds still publish, just with
+    # an empty results array and a season that looks like it never started.
+    leagues_without_results: list[str] = []
+
     for season_id, league_name in LEAGUES:
         try:
-            fixtures = fetch_fixtures(season_id, league_name)
+            fixtures, played = fetch_fixtures(season_id, league_name)
         except Exception as e:
             log.error(f"Failed to fetch fixtures for {league_name}: {e}")
-            fixtures = []
+            fixtures, played = [], []
 
         try:
             results = fetch_results(season_id, league_name)
         except Exception as e:
             log.error(f"Failed to fetch results for {league_name}: {e}")
             results = []
+
+        # Matches the league left on its fixture list with a score against them
+        # count as results too — see fetch_fixtures.
+        results = merge_results(results, played)
+
+        if fixtures and not results:
+            log.error(
+                f"  {league_name}: {len(fixtures)} fixtures but no results — "
+                f"results.json and participation will be empty for this league"
+            )
+            leagues_without_results.append(league_name)
 
         if not fixtures and not results:
             log.warning(f"No fresh data found for {league_name}")
@@ -1492,6 +1697,14 @@ def main() -> int:
         f"\nDone — {total_teams} team calendars, {len(all_clubs)} club feeds, "
         f"JSON feeds written across {len(LEAGUES)} leagues"
     )
+
+    if leagues_without_results:
+        missing = ", ".join(leagues_without_results)
+        log.error(
+            f"NO RESULTS SCRAPED for: {missing}. Their fixtures published, but "
+            f"results.json is empty and no participation records were built — "
+            f"check the results page for those leagues."
+        )
 
     if any(from_cache.values()):
         failed = ", ".join(sorted(from_cache))

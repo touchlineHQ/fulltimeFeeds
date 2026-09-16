@@ -188,18 +188,59 @@ league scan that builds `index.json`.
 
 ## How it works
 
-The scraper fetches all fixtures from Full-Time's fixtures page (`/fixtures/1/100000.html`) for each configured league season. All age groups within each league are included automatically — new teams and divisions appear as Full-Time updates.
+The scraper reads two Full-Time pages per league season: the fixtures page
+(`/fixtures/1/100000.html`) and the results page (`/results/1/100000.html`). All
+age groups within each league are included automatically — new teams and
+divisions appear as Full-Time updates.
 
-Each fixture row provides the date, time, home/away teams, venue, and competition (division) name. The scraper generates a `.ics` file and JSON feed per team, plus club-level and league-level JSON feeds, all organised under `calendars/` and `feeds/`.
+Each row provides the date, time, home/away teams, venue, and competition
+(division) name. The scraper generates a `.ics` file and JSON feed per team,
+plus club-level and league-level JSON feeds, all organised under `calendars/`
+and `feeds/`.
+
+### Getting the results
+
+Results are the fragile half of the scrape, so they are asked for more than one
+way and the first answer with rows in it wins:
+
+1. the results page for the whole season (`selectedDateCode=all`) — without a
+   date filter the page answers for a single period, often one with no matches
+   in it, and a season of played football comes back empty;
+2. the same page with no date filter, for a season that will not answer the
+   first way;
+3. the page rendered in a headless browser (Playwright), for when Full-Time
+   builds the table client-side. A static fetch of one of those is not an error
+   — it is a page with no match rows in it, which looks exactly like a league
+   that has not kicked off yet.
+
+A static fetch that fails outright fails at the transport (the WAF, or the
+network), so the remaining static attempt is skipped rather than leaning on a
+host that is already refusing us.
+
+**A played match is not always on the results page.** Full-Time leaves it on the
+fixture list until the league enters a result, and at U11 and below — where no
+result is ever published — some leagues never do. Those rows still carry a score
+cell (a score, or `X - X` where it is withheld), so the fixtures page is split
+into matches still to come and matches already played, and the played ones join
+the results. Only the dedicated score cell is read, so a venue or division with
+a dash in it can never take a real fixture out of the calendar.
+
+If a league yields fixtures but no results at all, the run logs
+`NO RESULTS SCRAPED` naming it. The feeds still publish; the message is there
+because the failure is otherwise invisible — an empty `results.json` and no
+participation records read exactly like a season that has not started.
 
 Currently configured leagues:
 
 | League | Season ID |
 |---|---|
-| YEL East Midlands Sunday 25/26 | `909330396` |
-| YEL East Midlands Saturday 25/26 | `161954265` |
-| Euro Soccer Nottinghamshire Senior League 25/26 | `355008724` |
-| Nottinghamshire Girls and Ladies Football League 25/26 | `258824685` |
+| YEL East Midlands Sunday 26/27 | `876713597` |
+| YEL East Midlands Saturday 26/27 | `773286682` |
+| Euro Soccer Nottinghamshire Senior League 26/27 | `918978398` |
+| Nottinghamshire Girls and Ladies Football League 26/27 | `179857386` |
+| Nottinghamshire Football League Saturday Youth 26/27 | `204486042` |
+| Nottinghamshire Football League Sunday Youth 26/27 | `134665924` |
+| East Midlands Veterans League 26/27 | `71450136` |
 
 ## Updating for a new season
 
@@ -227,7 +268,8 @@ restores that league's last published files from R2 so it stays in `index.json`.
 To run the scraper directly on the host:
 
 ```bash
-pip install curl-cffi beautifulsoup4
+pip install curl-cffi beautifulsoup4 lxml playwright
+playwright install chromium   # only needed for the results fallback
 python scraper/scrape.py
 # .ics files written to ./calendars/<league>/
 # JSON feeds written to ./feeds/
@@ -252,4 +294,5 @@ Run `scripts/run_scraper.sh` manually any time to force a refresh.
 - Team names are taken verbatim from Full-Time, except where the U11-and-below
   rules above replace an opposition name
 - The scraper uses `curl-cffi` with browser impersonation to fetch the page reliably (directly, no proxy)
+- Playwright (headless Chromium) is the last resort for the results page — see **Getting the results**. Without it that fallback is skipped and the run logs that it could not fetch a JS-rendered page
 - When a league produces no data on a run, its previously published feeds are restored from R2 rather than dropped

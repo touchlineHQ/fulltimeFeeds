@@ -23,6 +23,7 @@ from scrape import (
     fixtures_to_ics,
     parse_results,
     parse_fixtures,
+    parse_fixtures_page,
     restore_league_from_bucket,
 )
 import scrape
@@ -542,7 +543,7 @@ class TestMainExitCodes:
 
         def fake_fetch_fixtures(season_id, league_name):
             if outcomes[league_name] == "fresh":
-                return [self._fixture()]
+                return [self._fixture()], []
             raise RuntimeError("HTTP Error 403")
 
         def fake_fetch_results(season_id, league_name):
@@ -576,3 +577,349 @@ class TestMainExitCodes:
         by_slug = {e["slug"]: e for e in payload["leagues"]}
         assert by_slug["league-b"]["from_cache"] is True
         assert "from_cache" not in by_slug["league-a"]
+
+
+# ---------------------------------------------------------------------------
+# The Full-Time table — the markup both the fixtures and results pages use
+# ---------------------------------------------------------------------------
+
+_TABLE_HEADER = (
+    "<tr><th>Type</th><th>Date</th><th>Home Team</th><th></th><th></th>"
+    "<th></th><th>Away Team</th><th>Venue</th><th>Competition</th>"
+    "<th>Notes</th></tr>"
+)
+
+
+def _table_row(date, home, score, away, venue, competition):
+    """One Full-Time row: date and time run together, venue before competition."""
+    return f"""<tr>
+      <td class="color-dark-grey bold cell-divider">L</td>
+      <td class="left cell-divider">{date}</td>
+      <td class="home-team">{home}</td>
+      <td class="team-logo"></td>
+      <td class="score">{score}</td>
+      <td class="team-logo"></td>
+      <td class="road-team">{away}</td>
+      <td class="left cell-divider">{venue}</td>
+      <td class="left cell-divider">{competition}</td>
+      <td class="status-notes"></td>
+    </tr>"""
+
+
+def _table_page(*rows):
+    return f"<html><body><table>{_TABLE_HEADER}{''.join(rows)}</table></body></html>"
+
+
+class TestParseResultsTableLayout:
+    """The results page is the same table as the fixtures page."""
+
+    def test_venue_and_division_not_swapped(self):
+        """Bug: the table orders venue then competition, and both were read
+        the other way round — putting the ground in `division` and losing the
+        age group that decides whether a match may be published at all."""
+        html = _table_page(_table_row(
+            "13/09/2610:00", "Arnold Town Blue U14", "3 - 1", "Opponent FC U14",
+            "EAST LEAKE PLAYING FIELDS LE12 6LY", "U14 Sunday Division 1",
+        ))
+        results = parse_results(html)
+        assert len(results) == 1
+        assert results[0].venue == "EAST LEAKE PLAYING FIELDS LE12 6LY"
+        assert results[0].division_label == "U14 Sunday Division 1"
+
+    def test_reads_every_row_of_a_multi_row_table(self):
+        html = _table_page(
+            _table_row("13/09/2610:00", "A FC", "3 - 1", "B FC", "Ground A", "Div 1"),
+            _table_row("13/09/2612:00", "C FC", "0 - 0", "D FC", "Ground B", "Div 2"),
+            _table_row("13/09/2614:00", "E FC", "2 - 5", "F FC", "Ground C", "Div 3"),
+        )
+        assert [(r.home_score, r.away_score) for r in parse_results(html)] == [
+            (3, 1), (0, 0), (2, 5),
+        ]
+
+    def test_withheld_score_survives_as_a_scoreless_result(self):
+        """X - X means the match was played and the score is not published."""
+        html = _table_page(_table_row(
+            "13/09/2610:00", "Arnold Town Blue U9", "X - X", "Opponent FC U9",
+            "The Ground", "U9 Sunday",
+        ))
+        results = parse_results(html)
+        assert len(results) == 1
+        assert results[0].home_score is None and results[0].away_score is None
+
+    def test_unplayed_row_is_not_a_result(self):
+        html = _table_page(_table_row(
+            "20/09/2615:00", "A FC", "VS", "B FC", "The Ground", "Division One",
+        ))
+        assert parse_results(html) == []
+
+    def test_header_row_is_not_a_result(self):
+        assert parse_results(_table_page()) == []
+
+
+class TestParseFixturesPage:
+    """A played match left on the fixture list is a result, not a fixture."""
+
+    def test_unplayed_rows_are_fixtures(self):
+        html = _table_page(_table_row(
+            "20/09/2615:00", "Cotgrave Reserves", "VS", "East Leake Robins",
+            "COTGRAVE WELFARE CLUB #1", "Division One",
+        ))
+        fixtures, played = parse_fixtures_page(html)
+        assert played == []
+        assert len(fixtures) == 1
+        assert fixtures[0].venue == "COTGRAVE WELFARE CLUB #1"
+        assert fixtures[0].division_label == "Division One"
+
+    def test_scored_row_comes_back_as_a_result(self):
+        html = _table_page(_table_row(
+            "13/09/2610:00", "A FC U14", "3 - 1", "B FC U14", "The Ground", "U14 Div 1",
+        ))
+        fixtures, played = parse_fixtures_page(html)
+        assert fixtures == []
+        assert [(r.home_score, r.away_score) for r in played] == [(3, 1)]
+
+    def test_withheld_score_comes_back_as_a_played_match(self):
+        """At U11 and below the score is never published, so a league may
+        leave the match on its fixture list showing X - X forever."""
+        html = _table_page(_table_row(
+            "13/09/2610:00", "A FC U9", "X - X", "B FC U9", "The Ground", "U9 Sunday",
+        ))
+        fixtures, played = parse_fixtures_page(html)
+        assert fixtures == []
+        assert len(played) == 1
+        assert played[0].home_score is None and played[0].away_score is None
+
+    def test_numbers_elsewhere_in_the_row_do_not_make_a_match_played(self):
+        """Only the score cell decides — a venue or division with a dash in it
+        must not take a real fixture out of the calendar."""
+        html = _table_page(_table_row(
+            "20/09/2615:00", "A FC", "VS", "B FC",
+            "Pitch 3-4, Meadow Lane", "Div 1 (2025-26)",
+        ))
+        fixtures, played = parse_fixtures_page(html)
+        assert played == []
+        assert len(fixtures) == 1
+
+    def test_parse_fixtures_returns_only_upcoming(self):
+        html = _table_page(
+            _table_row("13/09/2610:00", "A FC", "3 - 1", "B FC", "Ground", "Div 1"),
+            _table_row("20/09/2610:00", "C FC", "VS", "D FC", "Ground", "Div 1"),
+        )
+        assert [f.home_team for f in parse_fixtures(html)] == ["C FC"]
+
+
+# ---------------------------------------------------------------------------
+# Fetching — URLs and fallbacks
+# ---------------------------------------------------------------------------
+
+class TestResultsUrl:
+
+    def test_asks_for_the_whole_season(self):
+        """Without a date filter the results page answers for one period only,
+        which is how a season of played matches comes back empty."""
+        url = scrape._results_url("918978398")
+        assert "selectedSeason=918978398" in url
+        assert "selectedDateCode=all" in url
+
+    def test_date_code_can_be_dropped(self):
+        assert "selectedDateCode" not in scrape._results_url("123", date_code="")
+
+
+class TestFetchResultsFallbacks:
+    """Each way of asking is tried until one produces rows."""
+
+    _RESULT_PAGE = _table_page(_table_row(
+        "13/09/2610:00", "A FC U14", "3 - 1", "B FC U14", "The Ground", "U14 Div 1",
+    ))
+
+    def test_stops_at_the_first_attempt_that_works(self, monkeypatch):
+        calls = []
+
+        def fake_static(url, label):
+            calls.append(url)
+            return self._RESULT_PAGE
+
+        monkeypatch.setattr(scrape, "_fetch_page", fake_static)
+        monkeypatch.setattr(scrape, "_fetch_page_js", lambda url, label: pytest.fail(
+            "browser render should not run when the static fetch has rows"
+        ))
+
+        assert len(scrape.fetch_results("123", "League A")) == 1
+        assert len(calls) == 1
+
+    def test_falls_back_to_a_browser_when_the_static_page_has_no_rows(self, monkeypatch):
+        """Full-Time renders some pages client-side: a static fetch of one is
+        not an error, it is a page with no match rows in it."""
+        rendered = []
+
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "<html><body></body></html>")
+
+        def fake_js(url, label):
+            rendered.append(url)
+            return self._RESULT_PAGE
+
+        monkeypatch.setattr(scrape, "_fetch_page_js", fake_js)
+
+        assert len(scrape.fetch_results("123", "League A")) == 1
+        assert rendered, "browser render was never tried"
+
+    def test_a_failing_fetch_does_not_abandon_the_remaining_attempts(self, monkeypatch):
+        def fake_static(url, label):
+            raise RuntimeError("HTTP Error 403")
+
+        monkeypatch.setattr(scrape, "_fetch_page", fake_static)
+        monkeypatch.setattr(scrape, "_fetch_page_js", lambda url, label: self._RESULT_PAGE)
+
+        assert len(scrape.fetch_results("123", "League A")) == 1
+
+    def test_returns_empty_when_nothing_works(self, monkeypatch):
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "")
+        monkeypatch.setattr(scrape, "_fetch_page_js", lambda url, label: "")
+
+        assert scrape.fetch_results("123", "League A") == []
+
+
+class TestFetchFixturesFallback:
+
+    def test_falls_back_to_a_browser_when_the_static_page_has_no_rows(self, monkeypatch):
+        page = _table_page(_table_row(
+            "20/09/2615:00", "A FC", "VS", "B FC", "The Ground", "Div 1",
+        ))
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "<html></html>")
+        monkeypatch.setattr(scrape, "_fetch_page_js", lambda url, label: page)
+
+        fixtures, played = scrape.fetch_fixtures("123", "League A")
+        assert len(fixtures) == 1 and played == []
+
+
+class TestMergeResults:
+
+    @staticmethod
+    def _result(home, score=1):
+        return scrape.Result(
+            date="13/09/26", time="10:00", home_team=home, away_team="B FC",
+            home_score=score, away_score=0, venue="Ground", division_label="Div 1",
+        )
+
+    def test_keeps_both_sources(self):
+        merged = scrape.merge_results([self._result("A FC")], [self._result("C FC")])
+        assert [r.home_team for r in merged] == ["A FC", "C FC"]
+
+    def test_results_page_wins_a_duplicate(self):
+        merged = scrape.merge_results([self._result("A FC", 3)], [self._result("A FC", 9)])
+        assert [r.home_score for r in merged] == [3]
+
+
+# ---------------------------------------------------------------------------
+# main() — a played match has to reach the feeds
+# ---------------------------------------------------------------------------
+
+class TestPlayedMatchesReachTheFeeds:
+    """The whole point of scraping results: a season that has started must not
+    read as a season that has not."""
+
+    LEAGUE = "YEL East Midlands Sunday 26/27"
+
+    def _run(self, monkeypatch, tmp_path, *, results, fixtures, played):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        monkeypatch.setattr(scrape, "OUTPUT_DIR", tmp_path / "calendars")
+        monkeypatch.setattr(scrape, "LEAGUES", [("111", self.LEAGUE)])
+        monkeypatch.setattr(scrape, "restore_league_from_bucket", lambda n, s: 0)
+        monkeypatch.setattr(scrape, "fetch_fixtures", lambda s, l: (fixtures, played))
+        monkeypatch.setattr(scrape, "fetch_results", lambda s, l: results)
+        scrape.main()
+        return json.loads(
+            (tmp_path / "feeds" / "clubs" / "east-leake.json").read_text(encoding="utf-8")
+        )
+
+    @staticmethod
+    def _result(home, away, home_score, away_score, division, date="13/09/26"):
+        return scrape.Result(
+            date=date, time="10:00", home_team=home, away_team=away,
+            home_score=home_score, away_score=away_score,
+            venue="East Leake Playing Fields", division_label=division,
+        )
+
+    @staticmethod
+    def _fixture(home, away, division, date="20/09/26"):
+        return Fixture(
+            date=date, time="15:00", home_team=home, away_team=away,
+            venue="Cotgrave Welfare", division_label=division,
+        )
+
+    def test_open_age_result_is_published_with_its_score(self, tmp_path, monkeypatch):
+        club = self._run(
+            monkeypatch, tmp_path,
+            results=[self._result("East Leake Robins", "Cotgrave Reserves", 2, 1, "Division One")],
+            fixtures=[self._fixture("East Leake Robins B", "Cotgrave Reserves", "Division Two")],
+            played=[],
+        )
+        assert [(r["goals_for"], r["goals_against"]) for r in club["results"]] == [(2, 1)]
+
+    def test_restricted_result_becomes_a_participation_record(self, tmp_path, monkeypatch):
+        club = self._run(
+            monkeypatch, tmp_path,
+            results=[self._result("East Leake Bantams Black U9", "Priory Celtic U9", None, None, "U9 Sunday")],
+            fixtures=[self._fixture("East Leake Robins", "Cotgrave Reserves", "Division One")],
+            played=[],
+        )
+        assert club["results"] == []
+        assert len(club["participation"]) == 1
+        record = club["participation"][0]
+        assert record["team"] == "East Leake Bantams Black U9"
+        assert record["age_group"] == "U9"
+        assert record["played"] is True
+        assert record["league"] == self.LEAGUE
+        # Nothing that says who it was against, where, or how it went.
+        assert not {"opponent", "venue", "home_score", "away_score"} & set(record)
+
+    def test_match_played_but_left_on_the_fixture_list_still_counts(self, tmp_path, monkeypatch):
+        """A league that never moves a U10 match onto its results page used to
+        leave it advertised as an upcoming fixture for the rest of the season."""
+        club = self._run(
+            monkeypatch, tmp_path,
+            results=[],
+            fixtures=[self._fixture("East Leake Robins", "Cotgrave Reserves", "Division One")],
+            played=[self._result(
+                "East Leake Bantams Orange U10", "Someone U10", None, None,
+                "U10 Sunday", date="06/09/26",
+            )],
+        )
+        assert [f["date"] for f in club["fixtures"]] == ["2026-09-20"]
+        assert [p["date"] for p in club["participation"]] == ["2026-09-06"]
+
+    def test_a_league_with_no_results_is_reported(self, tmp_path, monkeypatch, caplog):
+        with caplog.at_level("ERROR"):
+            self._run(
+                monkeypatch, tmp_path,
+                results=[],
+                fixtures=[self._fixture("East Leake Robins", "Cotgrave Reserves", "Division One")],
+                played=[],
+            )
+        assert any("NO RESULTS SCRAPED" in r.message for r in caplog.records)
+
+
+class TestScoreIsNotReadFromTheRestOfTheRow:
+    """A dash in a venue or a division name is not a score."""
+
+    def test_unplayed_row_with_dashes_around_it_is_not_a_result(self):
+        html = _table_page(_table_row(
+            "20/09/2615:00", "A FC", "VS", "B FC",
+            "Pitch 3-4, Meadow Lane", "Div 1 (2025-26)",
+        ))
+        assert parse_results(html) == []
+
+    def test_score_is_still_found_when_the_cell_is_not_a_sibling(self):
+        """Nested layouts keep working — the score is named, just not adjacent."""
+        html = """<html><body><div class="fixture">
+          <div class="date">22/03/26 12:30</div>
+          <div class="teams"><span class="home-team">A FC</span></div>
+          <div class="result"><span class="score">4 - 2</span></div>
+          <div class="teams"><span class="road-team">B FC</span></div>
+          <div class="competition">Div 1</div>
+        </div></body></html>"""
+        results = parse_results(html)
+        assert len(results) == 1
+        assert (results[0].home_score, results[0].away_score) == (4, 2)
+        # The division is one level out from the away cell, not beside it.
+        assert results[0].division_label == "Div 1"
