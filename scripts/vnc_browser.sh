@@ -20,6 +20,10 @@ PORT="${VNC_PORT:-5900}"
 WEB_PORT="${VNC_WEB_PORT:-6080}"
 PROFILE="${FULLTIME_CHROME_PROFILE:-/app/state/chrome-profile}"
 SAVE_DIR="${RESULTS_HTML_DIR:-/app/state/results}"
+# The browser exposes a debugging port so save_open_tabs.py can read the pages
+# you have loaded. Nothing navigates through it — it only reads what is on
+# screen, which is the same thing pressing Ctrl+S on each tab would write.
+CDP_PORT="${VNC_CDP_PORT:-9222}"
 SCREEN="${VNC_SCREEN:-1280x900x24}"
 
 # Typing a URL into a remote browser from a phone is miserable, so the tabs
@@ -157,7 +161,8 @@ done
 
 WIDTH="${SCREEN%%x*}"; REST="${SCREEN#*x}"; HEIGHT="${REST%%x*}"
 "$CHROME" --user-data-dir="$PROFILE" --no-first-run --no-default-browser-check \
-    --no-sandbox --window-size="$WIDTH,$HEIGHT" --window-position=0,0 \
+    --no-sandbox --remote-debugging-port="$CDP_PORT" \
+    --window-size="$WIDTH,$HEIGHT" --window-position=0,0 \
     "${URLS[@]}" >/tmp/chrome.log 2>&1 &
 CHROME_PID=$!
 
@@ -166,6 +171,13 @@ if ! kill -0 "$CHROME_PID" 2>/dev/null; then
     echo "The browser exited immediately. Its output:" >&2
     tail -20 /tmp/chrome.log >&2
     exit 1
+fi
+
+# Save each results tab as it finishes loading, so the pages do not have to be
+# saved by hand one at a time.
+if [ "${VNC_AUTOSAVE:-1}" != "0" ]; then
+    RESULTS_HTML_DIR="$SAVE_DIR" python3 "$(dirname "$0")/save_open_tabs.py" \
+        --endpoint "http://localhost:$CDP_PORT" --watch &
 fi
 
 cat <<EOF
@@ -180,8 +192,9 @@ cat <<EOF
                    (VNC truncates to 8 characters — this is what to type)
   Browser profile: $PROFILE (kept between runs)
   Tabs opened:     ${#URLS[@]} (one results page per configured league)
-  Save each with:  Ctrl+S into $SAVE_DIR
-                   (any filename — each page says which league it is)
+  Saving to:       $SAVE_DIR, automatically, as each tab finishes loading
+                   (clear any challenge shown and it is picked up next pass;
+                    set VNC_AUTOSAVE=0 to save by hand with Ctrl+S instead)
 
   Ctrl-C here when you are done.
 

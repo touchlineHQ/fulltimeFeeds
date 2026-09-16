@@ -349,10 +349,26 @@ expires, nothing is replayed, and no detection is involved.
 docker compose run --rm --service-ports scraper scripts/vnc_browser.sh
 ```
 
-That opens one tab per configured league. In each, `Ctrl+S` into
-`/app/state/results` (the `scraper_state` volume, also `RESULTS_HTML_DIR`).
-Filenames do not matter: each page names its own season in the links it renders,
-which is what identifies its league.
+That opens one tab per configured league and saves each one to
+`/app/state/results` (the `scraper_state` volume, also `RESULTS_HTML_DIR`) as it
+finishes loading. Clear anything Full-Time asks of you in a tab and it is picked
+up on the next pass; the console says which league landed and how many results
+it held:
+
+```
+  Euro Soccer Nottinghamshire Senior League 26/27: saved 918978398.html (143 result(s))
+  East Midlands Veterans League 26/27: still showing a challenge — solve it in the browser
+```
+
+`scripts/save_open_tabs.py` does that, and can be run on its own from the
+terminal in the VNC session. It reads the pages already on screen and writes
+them out — it never navigates, reloads or opens anything, because every page it
+saves was fetched by the person driving the browser. Reading a rendered page
+makes no request, which is why this works where driving the browser does not.
+
+Set `VNC_AUTOSAVE=0` to turn it off and save tabs by hand with `Ctrl+S` instead;
+filenames do not matter then, since each page names its own season in the links
+it renders.
 
 The scraper uses a saved page only when a live fetch and the browser have both
 failed, so live data always wins when it is available. The run summary says
