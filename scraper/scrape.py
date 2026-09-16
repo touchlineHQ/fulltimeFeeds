@@ -150,6 +150,11 @@ def _fetch_page(url: str, label: str) -> str:
     raise last_err  # type: ignore[misc]
 
 
+def _is_challenge_page(html: str) -> bool:
+    """True when a 200 response is really a WAF interstitial rather than data."""
+    return "attention required" in html[:4000].lower()
+
+
 def fetch_fixtures(season_id: str, league_name: str) -> list[Fixture]:
     """Fetch all upcoming fixtures for a given season/league."""
     url = f"{FIXTURES_URL}?selectedSeason={season_id}&selectedFixtureGroupKey="
@@ -231,15 +236,29 @@ def _fetch_page_js(url: str, label: str) -> str:
     return ""
 
 
+class ResultsUnavailable(Exception):
+    """Full-Time refused the results page.
+
+    Every route that carries a score answers an automated client with a
+    Cloudflare challenge: the whole-season results listing at any page size, the
+    bare /results.html route, the per-division results link the site emits
+    itself (league + selectedDivision + selectedFixtureGroupKey), and
+    displayFixture.html for a single match.  The fixtures listing serves 1000+
+    rows to the same session, one request apart, so this is a rule scoped to
+    the pages carrying scores rather than a block on the scraper.
+
+    Raised so an empty `results` array can be published as "withheld from us"
+    rather than "nobody played" — the two are indistinguishable otherwise, and
+    a club site rendering an empty results section looks broken.
+    """
+
+
 def fetch_results(season_id: str, league_name: str) -> list[Result]:
     """Fetch all results for a given season/league.
 
-    Unlike the fixtures page, Full-Time builds the results table client-side:
-    the static HTML carries the page shell and no rows, so parsing it yields
-    nothing and every feed publishes an empty `results` array.  The static
-    fetch is still tried first — it is cheap, and returns rows whenever
-    Full-Time does serve them server-side — and a headless browser render is
-    used whenever it comes back with no rows.
+    Raises ResultsUnavailable when Full-Time refuses the page.  A headless
+    browser is not tried: Chromium receives the same challenge page as a plain
+    fetch, so rendering only costs a browser launch per league per run.
     """
     url = f"{RESULTS_URL}?selectedSeason={season_id}&selectedFixtureGroupKey="
     label = f"results/{league_name}"
@@ -248,21 +267,13 @@ def fetch_results(season_id: str, league_name: str) -> list[Result]:
     try:
         html = _fetch_page(url, label)
     except Exception as e:
-        log.warning(f"  {label}: static fetch failed ({e}) — rendering with a browser")
-        html = ""
+        raise ResultsUnavailable(f"{league_name}: results page refused ({e})") from e
 
-    if html:
-        log.debug(f"Results HTML length: {len(html)}, tables: {html.count('<table')}")
-        results = parse_results(html)
-        if results:
-            return results
-        log.warning(f"  {label}: static HTML held no result rows — rendering with a browser")
+    if _is_challenge_page(html):
+        raise ResultsUnavailable(f"{league_name}: results page returned a challenge page")
 
-    rendered = _fetch_page_js(url, label)
-    if not rendered:
-        log.error(f"  {label}: browser render produced nothing — no results this run")
-        return []
-    return parse_results(rendered)
+    log.debug(f"Results HTML length: {len(html)}, tables: {html.count('<table')}")
+    return parse_results(html)
 
 
 def _find_fixture_table(soup: BeautifulSoup, context: str) -> object | None:
@@ -863,6 +874,7 @@ def write_league_feed(
     fixtures: list[Fixture],
     results: list[Result],
     generated: str,
+    results_unavailable: bool = False,
 ) -> None:
     """Write fixtures.json and results.json for a league.
 
@@ -901,6 +913,7 @@ def write_league_feed(
     results_payload = {
         "league": league_name,
         "generated": generated,
+        **({"results_unavailable": True} if results_unavailable else {}),
         "compliance": compliance_meta(results_withheld),
         "results": sorted(
             open_result_rows,
@@ -944,6 +957,7 @@ def write_team_feed(
     fixtures: list[Fixture],
     results: list[Result],
     generated: str,
+    results_unavailable: bool = False,
 ) -> None:
     """Write a JSON file with fixtures and results relevant to a single team.
 
@@ -1003,6 +1017,7 @@ def write_team_feed(
         "team": team_name,
         "league": league_name,
         "generated": generated,
+        **({"results_unavailable": True} if results_unavailable else {}),
         "compliance": compliance_meta(results_withheld),
         "fixtures": team_fixtures,
         "results": team_results,
@@ -1358,6 +1373,7 @@ def write_club_feed(
     team_fixtures: list[dict],
     team_results: list[dict],
     generated: str,
+    results_unavailable: bool = False,
 ) -> None:
     """Write feeds/clubs/<slug>.json aggregating all teams in a club across leagues.
 
@@ -1403,6 +1419,7 @@ def write_club_feed(
     payload = {
         "club": club_name,
         "generated": generated,
+        **({"results_unavailable": True} if results_unavailable else {}),
         "compliance": compliance_meta(results_withheld),
         "fixtures": sorted(safe_club_fixtures, key=lambda x: (x["date"], x["time"])),
         "results": sorted(safe_club_results, key=lambda x: (x["date"], x["time"]), reverse=True),
@@ -1494,6 +1511,10 @@ def main() -> int:
     all_team_result_rows: list[dict] = []
     all_team_names: list[str] = []
 
+    # Leagues whose results Full-Time refused this run. A club playing in one of
+    # them has an incomplete results array, and its feed says so.
+    leagues_without_results: set[str] = set()
+
     for season_id, league_name in LEAGUES:
         try:
             fixtures = fetch_fixtures(season_id, league_name)
@@ -1501,8 +1522,16 @@ def main() -> int:
             log.error(f"Failed to fetch fixtures for {league_name}: {e}")
             fixtures = []
 
+        results_unavailable = False
         try:
             results = fetch_results(season_id, league_name)
+        except ResultsUnavailable as e:
+            log.error(
+                f"RESULTS UNAVAILABLE — {e}. Feeds for this league will say so; "
+                f"an empty results array does not mean no match was played."
+            )
+            results = []
+            results_unavailable = True
         except Exception as e:
             log.error(f"Failed to fetch results for {league_name}: {e}")
             results = []
@@ -1515,7 +1544,7 @@ def main() -> int:
                 log.warning(f"  {league_name}: kept previously published data")
             continue
 
-        if fixtures and not results:
+        if fixtures and not results and not results_unavailable:
             # Not fatal — a league genuinely has no results before its first
             # round — but it is also what a silently broken results scrape
             # looks like, and it leaves every played match out of the feeds.
@@ -1555,7 +1584,13 @@ def main() -> int:
                 log.info(f"    {filename.name} ({len(team_fixtures)} fixtures)")
 
         # --- JSON feeds (league + team level) ---
-        write_league_feed(league_name, league_slug_name, fixtures, results, generated)
+        if results_unavailable:
+            leagues_without_results.add(league_name)
+
+        write_league_feed(
+            league_name, league_slug_name, fixtures, results, generated,
+            results_unavailable=results_unavailable,
+        )
 
         team_index_entries: list[dict] = []
         for team_name in all_teams:
@@ -1565,6 +1600,7 @@ def main() -> int:
                 teams_fixtures.get(team_name, []),
                 teams_results.get(team_name, []),
                 generated,
+                results_unavailable=results_unavailable,
             )
             team_index_entries.append({"name": team_name, "slug": team_slug_name})
 
@@ -1611,11 +1647,14 @@ def main() -> int:
 
     for club_name in all_clubs:
         club_slug_name = slug(club_name)
+        club_rows = club_fixtures.get(club_name, []) + club_results.get(club_name, [])
+        club_leagues = {row["league"] for row in club_rows if row.get("league")}
         write_club_feed(
             club_name, club_slug_name,
             club_fixtures.get(club_name, []),
             club_results.get(club_name, []),
             generated,
+            results_unavailable=bool(club_leagues & leagues_without_results),
         )
         teams_in_club = sorted(
             {r["team"] for r in club_fixtures.get(club_name, [])}

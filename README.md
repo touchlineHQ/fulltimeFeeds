@@ -210,13 +210,49 @@ league scan that builds `index.json`.
 
 The scraper fetches all fixtures from Full-Time's fixtures page (`/fixtures/1/100000.html`) for each configured league season. All age groups within each league are included automatically — new teams and divisions appear as Full-Time updates.
 
-Results come from `/results/1/100000.html`. That table is rendered client-side,
-so the static HTML holds the page shell and no rows; the scraper tries the plain
-fetch first and re-fetches through headless Chromium (Playwright) whenever it
-parses no rows, which is why Playwright is a runtime dependency rather than a
-developer convenience. A league that returns fixtures but no results is logged
-as a warning on every run — it is normal before a league's first round, and is
-also what a silently broken results scrape looks like.
+### Results are currently unavailable
+
+Full-Time serves the fixtures listing to the scraper and refuses every page that
+carries a score. Measured against the live site, one request apart, in the same
+session:
+
+| Route | Response |
+|---|---|
+| `/fixtures/1/100000.html` | 200, 1030 matches |
+| `/results/1/100000.html` (any page size, bare `/results.html`, warmed session) | 403 Cloudflare challenge |
+| `/results.html` with the site's own `league`/`selectedDivision`/`selectedFixtureGroupKey` | 403 Cloudflare challenge |
+| `/displayFixture.html?id=…` (single match page) | 403 Cloudflare challenge |
+
+Headless Chromium receives the same challenge page, so rendering does not help —
+it only costs a browser launch per league per run. `scripts/diagnose_results.py`,
+`scripts/discover_routes.py` and `scripts/probe_real_results.py` reproduce the
+above if the situation changes.
+
+So `fetch_results` raises `ResultsUnavailable` when the page is refused, and
+every feed for an affected league carries `"results_unavailable": true` beside
+its `generated` timestamp:
+
+```json
+{
+  "club": "East Leake",
+  "generated": "2026-09-16T18:27:36Z",
+  "results_unavailable": true,
+  "results": []
+}
+```
+
+**An empty `results` array on such a feed means the data was withheld from the
+scraper, not that no match was played** — render "results unavailable" rather
+than an empty results section, which reads as a broken page. The flag is absent
+whenever results were reachable, so absent or `false` means the array is real.
+`participation` is affected the same way: a U11-and-below match that never
+appears on a reachable page cannot be recorded as played, so participation
+covers only restricted fixtures whose date has passed while they sit on the
+fixtures page.
+
+Getting results back means obtaining them from Full-Time through a supported
+route — a league administrator can enable data feeds for club websites — rather
+than from these pages.
 
 Each fixture row provides the date, time, home/away teams, venue, and competition (division) name. The scraper generates a `.ics` file and JSON feed per team, plus club-level and league-level JSON feeds, all organised under `calendars/` and `feeds/`.
 

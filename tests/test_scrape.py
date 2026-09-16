@@ -816,7 +816,7 @@ class TestWriteClubFeed:
 
 
 # ---------------------------------------------------------------------------
-# fetch_results — browser fallback when the static page renders no rows
+# fetch_results — a refused page is reported, not published as "no results"
 # ---------------------------------------------------------------------------
 
 class TestFetchResults:
@@ -830,46 +830,114 @@ class TestFetchResults:
             venue="Costock Road", division_label="Division One",
         )
 
-    def test_static_html_with_rows_skips_the_browser(self, monkeypatch):
-        calls = []
+    def test_rows_are_returned_when_the_page_answers(self, monkeypatch):
         monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "<html>rows</html>")
         monkeypatch.setattr(scrape, "parse_results", lambda html: [self._result()])
-        monkeypatch.setattr(scrape, "_fetch_page_js", lambda url, label: calls.append(url) or "")
 
         assert len(scrape.fetch_results("123", "League A")) == 1
-        assert calls == []
 
-    def test_empty_static_html_falls_back_to_the_browser(self, monkeypatch):
-        rendered = []
-        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "<html>shell only</html>")
-        monkeypatch.setattr(
-            scrape, "_fetch_page_js",
-            lambda url, label: rendered.append(url) or "<html>rows</html>",
-        )
-        monkeypatch.setattr(
-            scrape, "parse_results",
-            lambda html: [self._result()] if "rows" in html else [],
-        )
-
-        results = scrape.fetch_results("123", "League A")
-
-        assert len(rendered) == 1
-        assert "selectedSeason=123" in rendered[0]
-        assert [r.home_team for r in results] == ["East Leake Robins"]
-
-    def test_blocked_static_fetch_falls_back_to_the_browser(self, monkeypatch):
+    def test_refused_fetch_raises_results_unavailable(self, monkeypatch):
         def blocked(url, label):
             raise RuntimeError("HTTP Error 403")
 
         monkeypatch.setattr(scrape, "_fetch_page", blocked)
-        monkeypatch.setattr(scrape, "_fetch_page_js", lambda url, label: "<html>rows</html>")
-        monkeypatch.setattr(scrape, "parse_results", lambda html: [self._result()])
 
-        assert len(scrape.fetch_results("123", "League A")) == 1
+        with pytest.raises(scrape.ResultsUnavailable, match="League A"):
+            scrape.fetch_results("123", "League A")
 
-    def test_both_paths_empty_returns_no_results(self, monkeypatch):
-        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "")
-        monkeypatch.setattr(scrape, "_fetch_page_js", lambda url, label: "")
+    def test_challenge_page_served_as_200_raises_too(self, monkeypatch):
+        # Cloudflare answers the results path with an interstitial; a 200
+        # carrying one is not data, and must not read as "no matches played".
+        challenge = "<html><head><title>Attention Required!</title></head></html>"
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: challenge)
+
+        with pytest.raises(scrape.ResultsUnavailable):
+            scrape.fetch_results("123", "League A")
+
+    def test_a_genuinely_empty_league_is_not_an_error(self, monkeypatch):
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "<html>no rows yet</html>")
         monkeypatch.setattr(scrape, "parse_results", lambda html: [])
 
         assert scrape.fetch_results("123", "League A") == []
+
+    def test_no_browser_render_is_attempted(self, monkeypatch):
+        # Headless Chromium receives the same challenge page, so rendering only
+        # costs a browser launch per league per run.
+        rendered = []
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "<html>rows</html>")
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [self._result()])
+        monkeypatch.setattr(
+            scrape, "_fetch_page_js", lambda url, label: rendered.append(url) or "",
+        )
+
+        scrape.fetch_results("123", "League A")
+
+        assert rendered == []
+
+
+# ---------------------------------------------------------------------------
+# results_unavailable — an empty results array that says why
+# ---------------------------------------------------------------------------
+
+class TestResultsUnavailableFlag:
+
+    def test_club_feed_flags_a_league_that_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        scrape.write_club_feed(
+            "East Leake", "east-leake",
+            [_row("m1", "East Leake Robins", "home")], [],
+            "2026-09-16T12:00:00Z", results_unavailable=True,
+        )
+
+        payload = json.loads(
+            (tmp_path / "feeds" / "clubs" / "east-leake.json").read_text(encoding="utf-8")
+        )
+        assert payload["results_unavailable"] is True
+        assert payload["results"] == []
+
+    def test_absent_when_results_were_reachable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        scrape.write_club_feed(
+            "East Leake", "east-leake",
+            [_row("m1", "East Leake Robins", "home")], [],
+            "2026-09-16T12:00:00Z",
+        )
+
+        payload = json.loads(
+            (tmp_path / "feeds" / "clubs" / "east-leake.json").read_text(encoding="utf-8")
+        )
+        assert "results_unavailable" not in payload
+
+    def test_main_flags_every_feed_when_the_results_page_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        monkeypatch.setattr(scrape, "OUTPUT_DIR", tmp_path / "calendars")
+        monkeypatch.setattr(scrape, "LEAGUES", [("111", "League A")])
+        monkeypatch.setattr(
+            scrape, "fetch_fixtures",
+            lambda season, league: [
+                Fixture("11/10/26", "15:00", "East Leake Robins",
+                        "East Leake Robins Reserves", "Costock Road", "Division One"),
+            ],
+        )
+
+        def refused(season, league):
+            raise scrape.ResultsUnavailable(f"{league}: results page refused")
+
+        monkeypatch.setattr(scrape, "fetch_results", refused)
+
+        assert scrape.main() == 0
+
+        club = json.loads(
+            (tmp_path / "feeds" / "clubs" / "east-leake.json").read_text(encoding="utf-8")
+        )
+        league = json.loads(
+            (tmp_path / "feeds" / "league-a" / "results.json").read_text(encoding="utf-8")
+        )
+        team = json.loads(
+            (tmp_path / "feeds" / "league-a" / "teams" / "east-leake-robins.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert club["results_unavailable"] is True
+        assert league["results_unavailable"] is True
+        assert team["results_unavailable"] is True
