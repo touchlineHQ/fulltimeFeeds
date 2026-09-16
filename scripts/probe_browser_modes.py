@@ -38,8 +38,8 @@ import scrape  # noqa: E402
 
 DEFAULT_SEASON = "918978398"
 ROW_SELECTOR = "td.home-team"
-# Cloudflare's interstitial can take several seconds to clear itself.
-SETTLE_MS = 25_000
+# How long to let Cloudflare's interstitial clear itself before giving up.
+SETTLE_SECONDS = 60
 
 
 def start_virtual_display() -> subprocess.Popen | None:
@@ -74,15 +74,55 @@ def start_virtual_display() -> subprocess.Popen | None:
     return None
 
 
-def verdict(html: str) -> str:
+# Cloudflare shows two different pages, and they mean opposite things.
+# "Attention Required!" is a refusal. "Just a moment..." is a challenge being
+# offered — a browser is expected to solve it and be given a cf_clearance
+# cookie. Reaching the second from the first is progress, not failure.
+BLOCK_MARKERS = ("attention required",)
+CHALLENGE_MARKERS = ("just a moment", "checking your browser", "cf-challenge")
+
+
+def challenge_state(html: str) -> str | None:
+    head = html[:4000].lower()
+    if any(m in head for m in BLOCK_MARKERS):
+        return "BLOCKED (refused outright)"
+    if any(m in head for m in CHALLENGE_MARKERS):
+        return "CHALLENGE (offered, unsolved)"
+    return None
+
+
+def verdict(html: str, cookies: list[dict] | None = None) -> str:
     if not html:
         return "nothing returned"
-    if "attention required" in html[:4000].lower():
-        return f"CHALLENGE ({len(html):,} bytes)"
+
+    cleared = any(c["name"] == "cf_clearance" for c in cookies or [])
+    suffix = ", cf_clearance held" if cleared else ""
+
+    state = challenge_state(html)
+    if state:
+        return f"{state} ({len(html):,} bytes){suffix}"
+
     rows = len(scrape.parse_results(html))
     if rows:
-        return f"OK — {rows} result(s) parsed ({len(html):,} bytes)"
-    return f"no challenge, but 0 rows parsed ({len(html):,} bytes)"
+        return f"OK — {rows} result(s) parsed ({len(html):,} bytes){suffix}"
+    return f"no challenge, but 0 rows parsed ({len(html):,} bytes){suffix}"
+
+
+def settle(page, seconds: int = SETTLE_SECONDS) -> str:
+    """Wait for a challenge to clear, not just for the rows to appear.
+
+    Cloudflare's interstitial reloads itself once solved, which can take much
+    longer than a selector wait allows for; polling until the challenge markers
+    are gone distinguishes "never solved it" from "was not given time".
+    """
+    deadline = time.time() + seconds
+    html = page.content()
+    while time.time() < deadline:
+        if not challenge_state(html) or page.query_selector(ROW_SELECTOR):
+            return page.content()
+        time.sleep(3)
+        html = page.content()
+    return html
 
 
 def via_curl(url: str, cookies: list[dict] | None = None) -> str:
@@ -116,7 +156,7 @@ def via_cdp(url: str, endpoint: str):
     Visit the results page in it once, so anything Cloudflare wants to set is
     set, then run this.
     """
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    from playwright.sync_api import sync_playwright
 
     with sync_playwright() as pw:
         browser = pw.chromium.connect_over_cdp(endpoint)
@@ -124,22 +164,18 @@ def via_cdp(url: str, endpoint: str):
         page = context.new_page()
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-            try:
-                page.wait_for_selector(ROW_SELECTOR, timeout=SETTLE_MS)
-            except PWTimeout:
-                pass
-            html = page.content()
+            html = settle(page)
             cookies = context.cookies()
         finally:
             # Close only the tab we opened; the browser is the operator's.
             page.close()
 
-    return verdict(html), cookies
+    return verdict(html, cookies), cookies
 
 
 def via_browser(url: str, *, headless, channel=None, profile=None, args=None):
     """Return (verdict, cookies). Cookies come back so they can be replayed."""
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    from playwright.sync_api import sync_playwright
 
     with sync_playwright() as pw:
         launch: dict = {"headless": headless}
@@ -158,18 +194,14 @@ def via_browser(url: str, *, headless, channel=None, profile=None, args=None):
         try:
             page = context.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-            try:
-                page.wait_for_selector(ROW_SELECTOR, timeout=SETTLE_MS)
-            except PWTimeout:
-                pass
-            html = page.content()
+            html = settle(page)
             cookies = context.cookies()
         finally:
             context.close()
             if browser:
                 browser.close()
 
-    return verdict(html), cookies
+    return verdict(html, cookies), cookies
 
 
 def main() -> int:
@@ -232,7 +264,8 @@ def main() -> int:
 
     print("=== summary ===")
     for label, out in results:
-        print(f"  {out.split(' ')[0]:12} {label}")
+        state = out.split(" (")[0].split(" —")[0]
+        print(f"  {state:28} {label}")
     print("\nBuild on whichever mode reports OK.")
     if xvfb:
         xvfb.terminate()
