@@ -576,3 +576,300 @@ class TestMainExitCodes:
         by_slug = {e["slug"]: e for e in payload["leagues"]}
         assert by_slug["league-b"]["from_cache"] is True
         assert "from_cache" not in by_slug["league-a"]
+
+
+# ---------------------------------------------------------------------------
+# Consolidation — one row per match in a club feed
+# ---------------------------------------------------------------------------
+
+def _row(match_id, team, home_away, **extra):
+    """A club-feed row: one per (team, match), as the aggregator builds them."""
+    row = {
+        "id": match_id,
+        "date": "2026-10-11",
+        "time": "10:00",
+        "home_team": "East Leake Orange U12",
+        "away_team": "East Leake Red U12",
+        "venue": "Costock Road",
+        "division": "U12 Division 6",
+        "league": "YEL Sunday 26/27",
+        "team": team,
+        "home_away": home_away,
+        "opponent": "East Leake Red U12" if home_away == "home" else "East Leake Orange U12",
+    }
+    row.update(extra)
+    return row
+
+
+class TestConsolidateMatches:
+
+    def test_derby_collapses_to_the_home_side(self):
+        rows = [
+            _row("m1", "East Leake Orange U12", "home"),
+            _row("m1", "East Leake Red U12", "away"),
+        ]
+
+        out = scrape.consolidate_matches(rows)
+
+        assert len(out) == 1
+        assert out[0]["team"] == "East Leake Orange U12"
+        assert out[0]["home_away"] == "home"
+        assert out[0]["derby"] is True
+
+    def test_home_side_wins_even_when_the_away_row_came_first(self):
+        rows = [
+            _row("m1", "East Leake Red U12", "away"),
+            _row("m1", "East Leake Orange U12", "home"),
+        ]
+
+        out = scrape.consolidate_matches(rows)
+
+        assert [r["team"] for r in out] == ["East Leake Orange U12"]
+        assert out[0]["derby"] is True
+
+    def test_same_team_twice_is_deduplicated_without_a_derby_flag(self):
+        rows = [
+            _row("m1", "East Leake Orange U12", "home"),
+            _row("m1", "East Leake Orange U12", "home"),
+        ]
+
+        out = scrape.consolidate_matches(rows)
+
+        assert len(out) == 1
+        assert "derby" not in out[0]
+
+    def test_distinct_matches_are_left_alone_and_keep_their_order(self):
+        rows = [
+            _row("m1", "East Leake Orange U12", "home"),
+            _row("m2", "East Leake Red U12", "away"),
+        ]
+
+        out = scrape.consolidate_matches(rows)
+
+        assert [r["id"] for r in out] == ["m1", "m2"]
+        assert all("derby" not in r for r in out)
+
+    def test_source_rows_are_not_mutated(self):
+        rows = [
+            _row("m1", "East Leake Orange U12", "home"),
+            _row("m1", "East Leake Red U12", "away"),
+        ]
+
+        scrape.consolidate_matches(rows)
+
+        assert all("derby" not in row for row in rows)
+
+
+class TestDropSettledFixtures:
+
+    def test_fixture_with_a_result_is_dropped(self):
+        fixtures = [_row("m1", "East Leake Robins", "home"), _row("m2", "East Leake Robins", "away")]
+        results = [_row("m1", "East Leake Robins", "home", home_score=3, away_score=1)]
+
+        out = scrape.drop_settled_fixtures(fixtures, results)
+
+        assert [r["id"] for r in out] == ["m2"]
+
+    def test_no_results_leaves_the_fixture_list_intact(self):
+        fixtures = [_row("m1", "East Leake Robins", "home")]
+
+        assert scrape.drop_settled_fixtures(fixtures, []) == fixtures
+
+
+class TestDedupeTeamRows:
+
+    def test_same_match_and_team_across_two_competitions_is_kept_once(self):
+        rows = [
+            _row("m1", "East Leake Robins", "home", league="League A"),
+            _row("m1", "East Leake Robins", "home", league="League B"),
+        ]
+
+        out = scrape.dedupe_team_rows(rows)
+
+        assert len(out) == 1
+        assert out[0]["league"] == "League A"
+
+    def test_two_teams_in_the_same_match_both_survive(self):
+        rows = [
+            _row("m1", "East Leake Orange U12", "home"),
+            _row("m1", "East Leake Red U12", "away"),
+        ]
+
+        assert len(scrape.dedupe_team_rows(rows)) == 2
+
+
+class TestWriteClubFeed:
+    """End-to-end shape of feeds/clubs/<slug>.json."""
+
+    @staticmethod
+    def _write(tmp_path, monkeypatch, fixtures, results, generated="2026-09-16T12:00:00Z"):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        scrape.write_club_feed("East Leake", "east-leake", fixtures, results, generated)
+        return json.loads(
+            (tmp_path / "feeds" / "clubs" / "east-leake.json").read_text(encoding="utf-8")
+        )
+
+    def test_open_age_derby_is_listed_once(self, tmp_path, monkeypatch):
+        fixtures = [
+            _row("m1", "East Leake Robins", "home",
+                 home_team="East Leake Robins", away_team="East Leake Robins Reserves",
+                 opponent="East Leake Robins Reserves", division="Division One"),
+            _row("m1", "East Leake Robins Reserves", "away",
+                 home_team="East Leake Robins", away_team="East Leake Robins Reserves",
+                 opponent="East Leake Robins", division="Division One"),
+        ]
+
+        payload = self._write(tmp_path, monkeypatch, fixtures, [])
+
+        assert len(payload["fixtures"]) == 1
+        assert payload["fixtures"][0]["derby"] is True
+        assert payload["fixtures"][0]["team"] == "East Leake Robins"
+
+    def test_played_match_appears_only_in_results(self, tmp_path, monkeypatch):
+        played = _row(
+            "m1", "East Leake Robins", "home",
+            date="2026-09-12", home_team="East Leake Robins", away_team="Awsworth Villa",
+            opponent="Awsworth Villa", division="Division One",
+        )
+        result = dict(played, home_score=3, away_score=1, goals_for=3, goals_against=1)
+
+        payload = self._write(tmp_path, monkeypatch, [played], [result])
+
+        assert payload["fixtures"] == []
+        assert [r["id"] for r in payload["results"]] == ["m1"]
+
+    def test_no_match_id_is_listed_in_two_arrays(self, tmp_path, monkeypatch):
+        fixtures = [
+            _row("m1", "East Leake Robins", "home", date="2026-09-12",
+                 home_team="East Leake Robins", away_team="Awsworth Villa",
+                 opponent="Awsworth Villa", division="Division One"),
+            _row("m2", "East Leake Robins", "away", date="2026-10-03",
+                 home_team="Cotgrave", away_team="East Leake Robins",
+                 opponent="Cotgrave", division="Division One"),
+        ]
+        results = [
+            dict(fixtures[0], home_score=3, away_score=1, goals_for=3, goals_against=1),
+        ]
+
+        payload = self._write(tmp_path, monkeypatch, fixtures, results)
+
+        fixture_ids = {r["id"] for r in payload["fixtures"]}
+        result_ids = {r["id"] for r in payload["results"]}
+        assert fixture_ids.isdisjoint(result_ids)
+        assert fixture_ids == {"m2"}
+
+    def test_restricted_derby_gives_both_teams_a_participation_record(self, tmp_path, monkeypatch):
+        # Played last Sunday, and never moved onto the results page — the
+        # league does not publish U12-and-below results.
+        fixtures = [
+            _row("m1", "East Leake Orange U10", "home", date="2026-09-13",
+                 home_team="East Leake Orange U10", away_team="East Leake Red U10",
+                 opponent="East Leake Red U10", division="U10 Division 1"),
+            _row("m1", "East Leake Red U10", "away", date="2026-09-13",
+                 home_team="East Leake Orange U10", away_team="East Leake Red U10",
+                 opponent="East Leake Orange U10", division="U10 Division 1"),
+        ]
+
+        payload = self._write(tmp_path, monkeypatch, fixtures, [])
+
+        assert payload["fixtures"] == []
+        assert {r["team"] for r in payload["participation"]} == {
+            "East Leake Orange U10", "East Leake Red U10",
+        }
+        assert all(r["played"] is True for r in payload["participation"])
+        assert len({r["id"] for r in payload["participation"]}) == 2
+
+    def test_restricted_upcoming_derby_is_listed_once_and_redacted(self, tmp_path, monkeypatch):
+        fixtures = [
+            _row("m1", "East Leake Orange U10", "home", date="2026-11-08",
+                 home_team="East Leake Orange U10", away_team="East Leake Red U10",
+                 opponent="East Leake Red U10", division="U10 Division 1"),
+            _row("m1", "East Leake Red U10", "away", date="2026-11-08",
+                 home_team="East Leake Orange U10", away_team="East Leake Red U10",
+                 opponent="East Leake Orange U10", division="U10 Division 1"),
+        ]
+
+        payload = self._write(tmp_path, monkeypatch, fixtures, [])
+
+        assert len(payload["fixtures"]) == 1
+        row = payload["fixtures"][0]
+        assert row["team"] == "East Leake Orange U10"
+        assert row["opponent"] == "Opposition"
+        assert row["away_team"] == "Opposition"
+        assert row["venue"] == ""
+        assert row["publication_restricted"] is True
+
+    def test_restricted_result_becomes_one_participation_record_per_team(self, tmp_path, monkeypatch):
+        results = [
+            _row("m1", "East Leake Orange U10", "home", date="2026-09-13",
+                 division="U10 Division 1", goals_for=None, goals_against=None),
+            _row("m1", "East Leake Red U10", "away", date="2026-09-13",
+                 division="U10 Division 1", goals_for=None, goals_against=None),
+        ]
+
+        payload = self._write(tmp_path, monkeypatch, [], results)
+
+        assert payload["results"] == []
+        assert len(payload["participation"]) == 2
+        assert payload["compliance"]["results_withheld"] == 2
+        assert all("goals_for" not in r for r in payload["participation"])
+
+
+# ---------------------------------------------------------------------------
+# fetch_results — browser fallback when the static page renders no rows
+# ---------------------------------------------------------------------------
+
+class TestFetchResults:
+
+    @staticmethod
+    def _result():
+        return scrape.Result(
+            date="12/09/26", time="15:00",
+            home_team="East Leake Robins", away_team="Awsworth Villa",
+            home_score=3, away_score=1,
+            venue="Costock Road", division_label="Division One",
+        )
+
+    def test_static_html_with_rows_skips_the_browser(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "<html>rows</html>")
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [self._result()])
+        monkeypatch.setattr(scrape, "_fetch_page_js", lambda url, label: calls.append(url) or "")
+
+        assert len(scrape.fetch_results("123", "League A")) == 1
+        assert calls == []
+
+    def test_empty_static_html_falls_back_to_the_browser(self, monkeypatch):
+        rendered = []
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "<html>shell only</html>")
+        monkeypatch.setattr(
+            scrape, "_fetch_page_js",
+            lambda url, label: rendered.append(url) or "<html>rows</html>",
+        )
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: [self._result()] if "rows" in html else [],
+        )
+
+        results = scrape.fetch_results("123", "League A")
+
+        assert len(rendered) == 1
+        assert "selectedSeason=123" in rendered[0]
+        assert [r.home_team for r in results] == ["East Leake Robins"]
+
+    def test_blocked_static_fetch_falls_back_to_the_browser(self, monkeypatch):
+        def blocked(url, label):
+            raise RuntimeError("HTTP Error 403")
+
+        monkeypatch.setattr(scrape, "_fetch_page", blocked)
+        monkeypatch.setattr(scrape, "_fetch_page_js", lambda url, label: "<html>rows</html>")
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [self._result()])
+
+        assert len(scrape.fetch_results("123", "League A")) == 1
+
+    def test_both_paths_empty_returns_no_results(self, monkeypatch):
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "")
+        monkeypatch.setattr(scrape, "_fetch_page_js", lambda url, label: "")
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [])
+
+        assert scrape.fetch_results("123", "League A") == []

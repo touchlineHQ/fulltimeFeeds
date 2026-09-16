@@ -232,12 +232,37 @@ def _fetch_page_js(url: str, label: str) -> str:
 
 
 def fetch_results(season_id: str, league_name: str) -> list[Result]:
-    """Fetch all results for a given season/league."""
+    """Fetch all results for a given season/league.
+
+    Unlike the fixtures page, Full-Time builds the results table client-side:
+    the static HTML carries the page shell and no rows, so parsing it yields
+    nothing and every feed publishes an empty `results` array.  The static
+    fetch is still tried first — it is cheap, and returns rows whenever
+    Full-Time does serve them server-side — and a headless browser render is
+    used whenever it comes back with no rows.
+    """
     url = f"{RESULTS_URL}?selectedSeason={season_id}&selectedFixtureGroupKey="
+    label = f"results/{league_name}"
     log.info(f"Fetching results for {league_name} ...")
-    html = _fetch_page(url, f"results/{league_name}")
-    log.debug(f"Results HTML length: {len(html)}, tables: {html.count('<table')}")
-    return parse_results(html)
+
+    try:
+        html = _fetch_page(url, label)
+    except Exception as e:
+        log.warning(f"  {label}: static fetch failed ({e}) — rendering with a browser")
+        html = ""
+
+    if html:
+        log.debug(f"Results HTML length: {len(html)}, tables: {html.count('<table')}")
+        results = parse_results(html)
+        if results:
+            return results
+        log.warning(f"  {label}: static HTML held no result rows — rendering with a browser")
+
+    rendered = _fetch_page_js(url, label)
+    if not rendered:
+        log.error(f"  {label}: browser render produced nothing — no results this run")
+        return []
+    return parse_results(rendered)
 
 
 def _find_fixture_table(soup: BeautifulSoup, context: str) -> object | None:
@@ -754,6 +779,84 @@ def result_to_dict(result: Result) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Consolidation
+#
+# Rows reach a team or club feed once per (team, match): a match is scraped for
+# its home side and again for its away side, and Full-Time lists a match on its
+# fixtures page as well as, once the score is in, on its results page.  Left
+# alone that puts the same game into a feed two or three times, which is what
+# these helpers exist to prevent.
+# ---------------------------------------------------------------------------
+
+def dedupe_team_rows(rows: list[dict]) -> list[dict]:
+    """Drop rows repeating the same match for the same team, keeping the first.
+
+    A team fielded in more than one configured season — a cup run alongside its
+    league, say — is scraped once per competition, and the duplicate rows are
+    identical apart from the league they came from.
+    """
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for row in rows:
+        key = (row.get("id"), row.get("team"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def drop_settled_fixtures(
+    fixture_rows: list[dict],
+    result_rows: list[dict],
+) -> list[dict]:
+    """Remove fixtures for matches that already have a result.
+
+    Full-Time keeps a played match on its fixtures page while the league enters
+    the score, and in some competitions after that too, so the same match
+    arrives from both pages.  Fixture and result IDs are built from the same
+    key (date and both team names), so a settled match is recognisable and is
+    listed as a result only.
+    """
+    played = {row["id"] for row in result_rows if row.get("id")}
+    return [row for row in fixture_rows if row.get("id") not in played]
+
+
+def consolidate_matches(rows: list[dict]) -> list[dict]:
+    """Collapse the two sides of a club's own derby into a single row.
+
+    When both teams in a match belong to the club whose feed this is, the match
+    is scraped once for each side and the two rows carry the same match ID — so
+    a list meant to hold one row per match holds the game twice.  The home
+    side's row is kept, because it already names both teams the right way
+    round, and is marked `derby` so a consumer can tell the opposition is one of
+    the club's own teams rather than another club.
+
+    Row order is preserved; callers sort afterwards.
+    """
+    position: dict[str, int] = {}
+    out: list[dict] = []
+    for row in rows:
+        match_id = row.get("id")
+        if match_id is None:
+            out.append(row)
+            continue
+        index = position.get(match_id)
+        if index is None:
+            position[match_id] = len(out)
+            out.append(row)
+            continue
+        held = out[index]
+        if held.get("team") == row.get("team"):
+            continue  # exact duplicate of a row already held
+        # Two of the club's own teams: keep whichever row is the home side's,
+        # so `team`/`opponent` read the same way round as `home_team`/`away_team`.
+        keep = row if row.get("home_away") == "home" else held
+        out[index] = {**keep, "derby": True}
+    return out
+
+
 def write_league_feed(
     league_name: str,
     league_slug: str,
@@ -772,7 +875,12 @@ def write_league_feed(
     league_dir = FEEDS_DIR / league_slug
     league_dir.mkdir(parents=True, exist_ok=True)
 
-    all_fixture_rows = [fixture_to_dict(f) for f in fixtures]
+    all_result_rows = [result_to_dict(r) for r in results]
+    # A match that has reached the results page is no longer a fixture, even
+    # while Full-Time keeps listing it as one.
+    all_fixture_rows = drop_settled_fixtures(
+        [fixture_to_dict(f) for f in fixtures], all_result_rows
+    )
     open_fixture_rows = [row for row in all_fixture_rows if not is_row_restricted(row)]
     fixtures_withheld = len(all_fixture_rows) - len(open_fixture_rows)
 
@@ -789,7 +897,7 @@ def write_league_feed(
         f"{fixtures_withheld} withheld at U11 and below)"
     )
 
-    open_result_rows, results_withheld = safe_results([result_to_dict(r) for r in results])
+    open_result_rows, results_withheld = safe_results(all_result_rows)
     results_payload = {
         "league": league_name,
         "generated": generated,
@@ -867,6 +975,10 @@ def write_team_feed(
         d["goals_for"] = r.home_score if is_home else r.away_score
         d["goals_against"] = r.away_score if is_home else r.home_score
         team_results.append(d)
+    # Full-Time lists a played match on both its pages until the league has
+    # finished with it; the settled ones belong in `results` alone.
+    team_fixtures = drop_settled_fixtures(team_fixtures, team_results)
+
     team_results, team_participation = split_results(team_results)
     results_withheld = len(team_participation)
 
@@ -1253,24 +1365,39 @@ def write_club_feed(
     `team` and `home_away`), so restricted fixtures keep that team's name and
     lose only the opposition and venue.  Restricted results are dropped, and
     reappear in `participation` as a record that the match was played.
+
+    Each match is listed once: a game between two of the club's own teams
+    arrives as two rows and is consolidated into the home side's, marked
+    `derby`, and a match already on the results page is left out of `fixtures`.
     """
     clubs_dir = FEEDS_DIR / "clubs"
     clubs_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_club_results, club_participation = split_results(team_results)
+    # Rows arrive one per (team, match). Drop the ones a team picked up twice
+    # by playing in more than one competition, then settle every match into
+    # exactly one of the three arrays below.
+    result_rows = dedupe_team_rows(team_results)
+    fixture_rows = drop_settled_fixtures(dedupe_team_rows(team_fixtures), result_rows)
+
+    # Participation is per team — it records that a team played, and in a derby
+    # both of the club's teams did — so it is built before the two sides of a
+    # match are consolidated into the single row a match gets elsewhere.
+    publishable_results, club_participation = split_results(result_rows)
     results_withheld = len(club_participation)
 
     # As in write_team_feed: a played restricted fixture with no results row
     # becomes a participation record instead of lingering as a fixture.
-    club_fixtures, played = played_fixtures(
-        team_fixtures,
+    fixture_rows, played = played_fixtures(
+        fixture_rows,
         generated[:10],
         existing_ids={record["id"] for record in club_participation},
     )
     club_participation.extend(played)
+
+    safe_club_results = consolidate_matches(publishable_results)
     safe_club_fixtures = [
         redact_fixture(row, row.get("team")) if is_row_restricted(row) else row
-        for row in club_fixtures
+        for row in consolidate_matches(fixture_rows)
     ]
 
     payload = {
@@ -1387,6 +1514,15 @@ def main() -> int:
             if restore_league_from_bucket(league_name, league_slug_name):
                 log.warning(f"  {league_name}: kept previously published data")
             continue
+
+        if fixtures and not results:
+            # Not fatal — a league genuinely has no results before its first
+            # round — but it is also what a silently broken results scrape
+            # looks like, and it leaves every played match out of the feeds.
+            log.warning(
+                f"  {league_name}: {len(fixtures)} fixtures but no results — "
+                f"played matches will be missing from results and participation"
+            )
 
         # Group fixtures/results by team name
         teams_fixtures: dict[str, list[Fixture]] = {}

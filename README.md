@@ -104,6 +104,26 @@ Result (in `results.json` and `results` arrays):
 
 Team and club feeds additionally include `league`, `team`, `home_away` (`"home"` or `"away"`), `opponent`, and (results only) `goals_for` and `goals_against`.
 
+### One match, one row
+
+Fixtures and results are scraped from two pages and grouped per team, so the
+same match can arrive more than once. Feeds settle each match into exactly one
+place:
+
+- **A match that has a result is not also a fixture.** Full-Time keeps a played
+  match on its fixtures page while the league enters the score, and after that
+  in some competitions. Once the score is published the match appears in
+  `results` only.
+- **A club derby is listed once.** When both teams belong to the same club, the
+  match is scraped for each side; the club feed keeps the home side's row —
+  which already names both teams the right way round — and marks it
+  `"derby": true`. The team feeds still carry a row each.
+- **Participation stays per team.** A derby at U11 or below produces a
+  participation record for each of the club's teams: both of them played.
+
+`id` is stable across the fixtures and results pages (it is derived from the
+date and both team names), so consumers can key on it.
+
 ### Publication rules for U11 and below
 
 The FA prohibits publishing match results and league tables for teams playing at
@@ -189,6 +209,14 @@ league scan that builds `index.json`.
 ## How it works
 
 The scraper fetches all fixtures from Full-Time's fixtures page (`/fixtures/1/100000.html`) for each configured league season. All age groups within each league are included automatically — new teams and divisions appear as Full-Time updates.
+
+Results come from `/results/1/100000.html`. That table is rendered client-side,
+so the static HTML holds the page shell and no rows; the scraper tries the plain
+fetch first and re-fetches through headless Chromium (Playwright) whenever it
+parses no rows, which is why Playwright is a runtime dependency rather than a
+developer convenience. A league that returns fixtures but no results is logged
+as a warning on every run — it is normal before a league's first round, and is
+also what a silently broken results scrape looks like.
 
 Each fixture row provides the date, time, home/away teams, venue, and competition (division) name. The scraper generates a `.ics` file and JSON feed per team, plus club-level and league-level JSON feeds, all organised under `calendars/` and `feeds/`.
 
