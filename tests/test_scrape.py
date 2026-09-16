@@ -1053,13 +1053,13 @@ class TestFetchResultsViaBrowser:
         monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
         browser = _FakeBrowser(html=CHALLENGE)
 
-        with pytest.raises(scrape.ResultsUnavailable, match="challenged the browser"):
+        with pytest.raises(scrape.ResultsUnavailable, match="no saved page was found"):
             scrape.fetch_results("123", "League A", browser=browser)
 
     def test_no_browser_available_raises_results_unavailable(self, monkeypatch):
         monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
 
-        with pytest.raises(scrape.ResultsUnavailable, match="no browser session"):
+        with pytest.raises(scrape.ResultsUnavailable, match="no saved page was found"):
             scrape.fetch_results("123", "League A", browser=None)
 
     def test_unstartable_browser_raises_results_unavailable(self, monkeypatch):
@@ -1068,7 +1068,7 @@ class TestFetchResultsViaBrowser:
         monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
         browser = _FakeBrowser(raises=BrowserUnavailable("no Xvfb"))
 
-        with pytest.raises(scrape.ResultsUnavailable, match="no browser to retry"):
+        with pytest.raises(scrape.ResultsUnavailable, match="no saved page was found"):
             scrape.fetch_results("123", "League A", browser=browser)
 
 
@@ -1280,3 +1280,116 @@ class TestResultsSessionPlugin:
             (tmp_path / "feeds" / "league-a" / "results.json").read_text(encoding="utf-8")
         )
         assert len(payload["results"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Saved pages — parsing what a browser already loaded
+# ---------------------------------------------------------------------------
+
+def _saved_page(directory, season_id, rows=1, name="Results.html"):
+    """A stand-in for a page saved from a browser, carrying its season marker."""
+    body = "".join(
+        f"<tr><td class='left'>1{i}/09/26 15:00</td>"
+        f"<td class='home-team'>East Leake Robins</td>"
+        f"<td class='score'>{i} - 0</td>"
+        f"<td class='road-team'>Cotgrave</td>"
+        f"<td class='left'>Division One</td></tr>"
+        for i in range(1, rows + 1)
+    )
+    path = directory / name
+    path.write_text(
+        f"<html><body><a href='/results/1/100000.html?selectedSeason={season_id}'>next</a>"
+        f"<table>{body}</table></body></html>",
+        encoding="utf-8",
+    )
+    return path
+
+
+class TestSavedResultsPage:
+
+    def test_a_page_is_matched_by_its_season_not_its_filename(self, tmp_path, monkeypatch):
+        # A browser names a saved page after its title, so the filename cannot
+        # be relied on to say which league it is.
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        _saved_page(tmp_path, "918978398", name="Full-Time  Results.html")
+
+        found = scrape._saved_results_page("918978398")
+
+        assert found is not None
+        assert "selectedSeason=918978398" in found[0]
+
+    def test_another_league_is_not_matched(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        _saved_page(tmp_path, "918978398")
+
+        assert scrape._saved_results_page("71450136") is None
+
+    def test_missing_directory_is_not_an_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path / "nope"))
+
+        assert scrape._saved_results_page("918978398") is None
+
+    def test_the_freshest_of_several_saves_wins(self, tmp_path, monkeypatch):
+        import os
+        import time
+
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        old = _saved_page(tmp_path, "918978398", rows=1, name="old.html")
+        new = _saved_page(tmp_path, "918978398", rows=3, name="new.html")
+        week_ago = time.time() - 7 * 86400
+        os.utime(old, (week_ago, week_ago))
+
+        html, age_days = scrape._saved_results_page("918978398")
+
+        assert len(scrape.parse_results(html)) == 3
+        assert age_days < 1
+
+
+class TestFetchResultsFromSavedPage:
+
+    def test_a_saved_page_is_used_when_everything_else_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        _saved_page(tmp_path, "918978398", rows=2)
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
+
+        results = scrape.fetch_results("918978398", "Euro Soccer", browser=None)
+
+        assert len(results) == 2
+        assert "saved page" in scrape.LAST_SOURCE
+
+    def test_a_working_fetch_is_preferred_over_a_saved_page(self, tmp_path, monkeypatch):
+        # A saved page is a fallback, not a cache: live data is fresher.
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        _saved_page(tmp_path, "918978398", rows=9)
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: ROWS)
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: [scrape.Result("12/09/26", "15:00", "A", "B", 1, 0, "G", "D")],
+        )
+
+        results = scrape.fetch_results("918978398", "Euro Soccer", browser=None)
+
+        assert len(results) == 1
+        assert scrape.LAST_SOURCE == "a plain fetch"
+
+    def test_the_browser_is_preferred_over_a_saved_page(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        _saved_page(tmp_path, "918978398", rows=9)
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
+        browser = _FakeBrowser(html=ROWS)
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: [scrape.Result("12/09/26", "15:00", "A", "B", 1, 0, "G", "D")],
+        )
+
+        results = scrape.fetch_results("918978398", "Euro Soccer", browser=browser)
+
+        assert len(results) == 1
+        assert scrape.LAST_SOURCE == "the browser"
+
+    def test_no_saved_page_still_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
+
+        with pytest.raises(scrape.ResultsUnavailable, match="no saved page was found"):
+            scrape.fetch_results("918978398", "Euro Soccer", browser=None)

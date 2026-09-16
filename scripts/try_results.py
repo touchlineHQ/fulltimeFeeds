@@ -23,7 +23,6 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scraper"))
 
 import scrape  # noqa: E402
-from browser import BrowserSession  # noqa: E402
 
 
 def pick(league: str | None, season: str | None) -> tuple[str, str]:
@@ -60,7 +59,9 @@ def main() -> int:
     print(f"url:    {scrape.RESULTS_URL}?selectedSeason={season_id}"
           f"&selectedFixtureGroupKey=\n")
 
-    browser = None if args.no_browser else BrowserSession()
+    # Must go through _results_browser(), not construct one: RESULTS_SESSION
+    # picks the fetcher, and building BrowserSession here silently ignored it.
+    browser = None if args.no_browser else scrape._results_browser()
     try:
         results = scrape.fetch_results(season_id, league_name, browser=browser)
     except scrape.ResultsUnavailable as e:
@@ -69,7 +70,7 @@ def main() -> int:
         return 1
     finally:
         if browser:
-            used = browser.fetches
+            used = getattr(browser, "fetches", 0)
             browser.close()
             print(f"\n(browser served {used} page(s) this run)")
 

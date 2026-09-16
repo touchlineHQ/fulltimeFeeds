@@ -338,6 +338,36 @@ drive. Bind it to localhost and tunnel over SSH if the network is not one you
 control.
 
 
+### Saving results by hand
+
+The results pages load perfectly in a browser driven by hand — that is the whole
+shape of the problem — so a page saved from one is ordinary HTML the parser is
+happy with, obtained the way anyone reading the site obtains it. Nothing
+expires, nothing is replayed, and no detection is involved.
+
+```bash
+docker compose run --rm --service-ports scraper scripts/vnc_browser.sh
+```
+
+That opens one tab per configured league. In each, `Ctrl+S` into
+`/app/state/results` (the `scraper_state` volume, also `RESULTS_HTML_DIR`).
+Filenames do not matter: each page names its own season in the links it renders,
+which is what identifies its league.
+
+The scraper uses a saved page only when a live fetch and the browser have both
+failed, so live data always wins when it is available. The run summary says
+which league came from where and how old each saved page is, and a page over a
+week old is called out:
+
+```
+Results per league:
+  Euro Soccer Nottinghamshire Senior 26/27    143 via a saved page (2.1 days old)
+  East Midlands Veterans League 26/27         REFUSED — published as unavailable
+```
+
+Results only change after matches are played, so a weekly pass is usually
+enough.
+
 ### Running nodriver for results
 
 `scraper/nodriver_session.py` is an optional fetcher, off unless named:

@@ -92,6 +92,12 @@ REFUSAL_RETRIES = 2
 # scraper has to run on the same machine and send the same User-Agent, and the
 # cookie has to be refreshed when Cloudflare expires it.  Feeds say
 # `results_unavailable` whenever it has.
+RESULTS_HTML_DIR_ENV = "RESULTS_HTML_DIR"
+DEFAULT_RESULTS_HTML_DIR = "/app/state/results"
+
+# How the last fetch_results call got its rows, for the end-of-run summary.
+LAST_SOURCE = ""
+
 COOKIE_ENV = "FULLTIME_COOKIE"
 USER_AGENT_ENV = "FULLTIME_USER_AGENT"
 
@@ -285,6 +291,40 @@ def _fetch_page_js(url: str, label: str) -> str:
     return ""
 
 
+def _saved_results_page(season_id: str) -> tuple[str, float] | None:
+    """A results page saved from a browser, for this season.
+
+    The pages load perfectly in a browser driven by hand — that is the whole
+    shape of the problem — so a page saved from one is ordinary HTML the parser
+    is happy with, obtained the way anyone reading the site obtains it.
+
+    Pages are identified by content rather than filename: a browser names a
+    saved page after its title, and asking someone to rename seven files over a
+    VNC session on a phone is not a plan. Every results page carries its own
+    season in the links it renders, which says which league it belongs to.
+
+    Returns (html, age in days) for the freshest match, or None.
+    """
+    directory = Path(os.environ.get(RESULTS_HTML_DIR_ENV) or DEFAULT_RESULTS_HTML_DIR)
+    if not directory.is_dir():
+        return None
+
+    marker = f"selectedSeason={season_id}"
+    best: tuple[str, float] | None = None
+    for path in sorted(directory.glob("*.htm*")):
+        try:
+            html = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            log.warning(f"Could not read saved page {path}: {e}")
+            continue
+        if marker not in html:
+            continue
+        age_days = max(0.0, (time.time() - path.stat().st_mtime) / 86400)
+        if best is None or age_days < best[1]:
+            best = (html, age_days)
+    return best
+
+
 class ResultsUnavailable(Exception):
     """Full-Time refused the results page.
 
@@ -317,6 +357,8 @@ def fetch_results(
     Raises ResultsUnavailable when both are refused, so an empty results array
     can be published as "withheld from us" rather than "nobody played".
     """
+    global LAST_SOURCE
+    LAST_SOURCE = ""
     url = f"{RESULTS_URL}?selectedSeason={season_id}&selectedFixtureGroupKey="
     label = f"results/{league_name}"
     log.info(f"Fetching results for {league_name} ...")
@@ -332,30 +374,44 @@ def fetch_results(
         log.debug(f"Results HTML length: {len(html)}, tables: {html.count('<table')}")
         # A page that answers with no rows is a league that has not played yet,
         # which is not the same as one we were refused.
+        LAST_SOURCE = "a plain fetch"
         return parse_results(html)
 
-    if browser is None:
-        raise ResultsUnavailable(
-            f"{league_name}: results page refused ({refusal or 'challenge page'}) "
-            f"and no browser session available"
-        )
+    if browser is not None:
+        log.info(f"  {label}: refused a plain fetch — retrying through the browser")
+        try:
+            rendered = browser.fetch(url, wait_selector="td.home-team")
+        except BrowserUnavailable as e:
+            log.warning(f"  {label}: no browser to retry with ({e})")
+            rendered = ""
+        except Exception as e:
+            log.warning(f"  {label}: browser fetch failed ({e})")
+            rendered = ""
 
-    log.info(f"  {label}: refused a plain fetch — retrying through the browser")
-    try:
-        rendered = browser.fetch(url, wait_selector="td.home-team")
-    except BrowserUnavailable as e:
-        raise ResultsUnavailable(f"{league_name}: no browser to retry with ({e})") from e
-    except Exception as e:
-        raise ResultsUnavailable(f"{league_name}: browser fetch failed ({e})") from e
+        if rendered and not is_challenge_page(rendered):
+            results = parse_results(rendered)
+            log.info(f"  {label}: {len(results)} result(s) via the browser")
+            LAST_SOURCE = "the browser"
+            return results
 
-    if not rendered or is_challenge_page(rendered):
-        raise ResultsUnavailable(
-            f"{league_name}: results page challenged the browser too"
-        )
+    # Last resort, and the one that does not depend on winning an argument with
+    # a WAF: a page someone loaded in a browser and saved.
+    saved = _saved_results_page(season_id)
+    if saved:
+        saved_html, age_days = saved
+        results = parse_results(saved_html)
+        LAST_SOURCE = f"a saved page ({age_days:.1f} days old)"
+        log.info(f"  {label}: {len(results)} result(s) from a page saved "
+                 f"{age_days:.1f} day(s) ago")
+        if age_days > 7:
+            log.warning(f"  {label}: that saved page is {age_days:.0f} days old — "
+                        f"save a fresh one to pick up recent results")
+        return results
 
-    results = parse_results(rendered)
-    log.info(f"  {label}: {len(results)} result(s) via the browser")
-    return results
+    raise ResultsUnavailable(
+        f"{league_name}: results page refused ({refusal or 'challenge page'}), "
+        f"no browser got through, and no saved page was found"
+    )
 
 
 def _find_fixture_table(soup: BeautifulSoup, context: str) -> object | None:
@@ -1664,19 +1720,12 @@ def _run(browser_holder: list) -> int:
             fixtures = []
 
         results_unavailable = False
-        browser_fetches_before = getattr(browser, "fetches", 0) if browser else 0
         try:
             results = fetch_results(season_id, league_name, browser=browser)
-            used_browser = (
-                bool(browser)
-                and getattr(browser, "fetches", 0) > browser_fetches_before
-            )
             results_report.append((
                 league_name,
-                f"{len(results)} via {'the browser' if used_browser else 'a plain fetch'}"
-                if results else
-                ("none — league has not played yet"
-                 if not used_browser else "none — the browser reached the page but it was empty"),
+                f"{len(results)} via {LAST_SOURCE}" if results
+                else f"none — reached via {LAST_SOURCE}, but the page held no rows",
             ))
         except ResultsUnavailable as e:
             log.error(

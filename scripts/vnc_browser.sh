@@ -19,17 +19,33 @@ set -euo pipefail
 PORT="${VNC_PORT:-5900}"
 WEB_PORT="${VNC_WEB_PORT:-6080}"
 PROFILE="${FULLTIME_CHROME_PROFILE:-/app/state/chrome-profile}"
+SAVE_DIR="${RESULTS_HTML_DIR:-/app/state/results}"
 SCREEN="${VNC_SCREEN:-1280x900x24}"
 
 # Typing a URL into a remote browser from a phone is miserable, so the tabs
 # that answer the usual questions are opened up front: what this machine gets
 # from the results page, and what public IP it comes from — which can then be
 # compared against the same page on the phone itself.
-RESULTS_URL="https://fulltime.thefa.com/results/1/100000.html?selectedSeason=918978398&selectedFixtureGroupKey="
 if [ "$#" -gt 0 ]; then
     URLS=("$@")
 else
-    URLS=("$RESULTS_URL" "https://api.ipify.org")
+    # Every configured league's results page, read from LEAGUES rather than
+    # written out here, so the tabs follow the scrape list. Save each one into
+    # RESULTS_HTML_DIR and the scraper parses it; see "Saving results by hand".
+    mapfile -t URLS < <(python3 -c "
+import sys
+sys.path.insert(0, '/app/scraper')
+from unittest.mock import MagicMock
+for mod in ('curl_cffi', 'curl_cffi.requests'):
+    sys.modules.setdefault(mod, MagicMock())
+import scrape
+for season_id, _ in scrape.LEAGUES:
+    print(f'{scrape.RESULTS_URL}?selectedSeason={season_id}&selectedFixtureGroupKey=')
+" 2>/dev/null)
+    if [ "${#URLS[@]}" -eq 0 ]; then
+        echo "Could not read the league list — opening the site's front page." >&2
+        URLS=("https://fulltime.thefa.com/")
+    fi
 fi
 
 if [ -z "${VNC_PASSWORD:-}" ]; then
@@ -121,7 +137,7 @@ if command -v xterm >/dev/null 2>&1; then
     xterm -geometry 100x24+0+600 -fa Monospace -fs 10 >/tmp/xterm.log 2>&1 &
 fi
 
-mkdir -p "$PROFILE"
+mkdir -p "$PROFILE" "$SAVE_DIR"
 
 # Chromium records the hostname and pid holding a profile in these files, and
 # refuses to start when they name someone else. Every `docker compose run` gets
@@ -163,7 +179,9 @@ cat <<EOF
   Password:        $VNC_SECRET
                    (VNC truncates to 8 characters — this is what to type)
   Browser profile: $PROFILE (kept between runs)
-  Tabs opened:     $(printf '%s ' "${URLS[@]}")
+  Tabs opened:     ${#URLS[@]} (one results page per configured league)
+  Save each with:  Ctrl+S into $SAVE_DIR
+                   (any filename — each page says which league it is)
 
   Ctrl-C here when you are done.
 
