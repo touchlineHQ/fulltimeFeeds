@@ -269,6 +269,21 @@ and refresh the cookie when Cloudflare expires it. Feeds carry
 `results_unavailable` on any run where it has expired, so a stale cookie shows
 up as a flagged feed rather than silently empty results.
 
+To try the one mode that is not a browser Playwright launched — attaching to an
+ordinary browser you started yourself — use the launcher, which finds whichever
+Chrome-family browser is installed rather than assuming a name:
+
+```bash
+./scripts/start_browser.sh          # starts it, or reports one already running
+# load the results page in that window once, by hand
+docker run --rm --network=host -v "$PWD/scripts:/app/scripts" \
+    yel-scraper:latest python scripts/probe_browser_modes.py
+```
+
+`--network=host` lets the container reach the browser's debugging port on
+localhost, so nothing needs installing outside Docker. `./scripts/start_browser.sh --stop`
+when finished.
+
 `scripts/probe_browser_modes.py` re-checks which automated modes are accepted,
 and `scripts/probe_alt_host.py` looks at `full-time.thefa.com` — the other
 Full-Time host — for an API that would beat parsing HTML entirely.
