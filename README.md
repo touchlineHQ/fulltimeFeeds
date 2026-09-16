@@ -338,6 +338,32 @@ drive. Bind it to localhost and tunnel over SSH if the network is not one you
 control.
 
 
+### Running nodriver for results
+
+`scraper/nodriver_session.py` is an optional fetcher, off unless named:
+
+```bash
+# .env
+RESULTS_SESSION=nodriver_session:Session
+```
+
+```bash
+docker compose run --rm -v "$PWD/scripts:/app/scripts" \
+    scraper python scripts/try_results.py       # one league, the real path
+docker compose up --build                       # a full run
+```
+
+nodriver drives Chrome without the attached-CDP pattern the challenge detects,
+which is the one difference between the run that works by hand and the run that
+does not. It needs a display, and starts Xvfb itself if there is none.
+
+Two things come with that choice. Automated access is likely contrary to
+Full-Time's terms, even though the data is public and readable by hand from the
+same machine — that call belongs to whoever runs this. And it is an arms race:
+expect it to stop working after a Cloudflare or Chrome update, without notice.
+When it does, the league is published as `results_unavailable` and the feed says
+so rather than quietly going empty.
+
 ### Supplying your own results fetcher
 
 If you want to make that call yourself, `RESULTS_SESSION` takes any fetcher,

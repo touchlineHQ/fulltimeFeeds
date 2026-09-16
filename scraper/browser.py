@@ -38,6 +38,56 @@ class BrowserUnavailable(RuntimeError):
     """No browser could be started — Playwright missing, or no binary."""
 
 
+def ensure_display() -> subprocess.Popen | None:
+    """Make sure there is a display to draw on, starting Xvfb if there is not.
+
+    Returns the Xvfb process when one was started, so the caller can stop it,
+    or None when a display was already set. xvfb-run would do this but needs
+    xauth, which the slim image does not carry; driving Xvfb directly needs
+    neither.
+    """
+    if os.environ.get("DISPLAY"):
+        return None
+    if not shutil.which("Xvfb"):
+        raise BrowserUnavailable("no DISPLAY and no Xvfb to start one")
+
+    proc = subprocess.Popen(
+        ["Xvfb", ":99", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    socket = pathlib.Path("/tmp/.X11-unix/X99")
+    for _ in range(50):
+        if socket.exists():
+            os.environ["DISPLAY"] = ":99"
+            log.info("  browser: started Xvfb on :99")
+            return proc
+        if proc.poll() is not None:
+            raise BrowserUnavailable("Xvfb exited before opening its socket")
+        time.sleep(0.1)
+    proc.terminate()
+    raise BrowserUnavailable("Xvfb never opened its socket")
+
+
+def find_chromium() -> str:
+    """Path to a bundled Chromium, whatever build this image happens to carry."""
+    roots = [
+        os.environ.get("PLAYWRIGHT_BROWSERS_PATH"),
+        str(pathlib.Path.home() / ".cache/ms-playwright"),
+        "/root/.cache/ms-playwright",
+        "/opt/pw-browsers",
+    ]
+    for root in roots:
+        if not root:
+            continue
+        base = pathlib.Path(root)
+        if not base.is_dir():
+            continue
+        found = sorted(base.glob("chromium-*/chrome-linux*/chrome"))
+        if found:
+            return str(found[-1])
+    raise BrowserUnavailable("no chromium binary found in this image")
+
+
 def is_challenge_page(html: str) -> bool:
     """True when a response is an interstitial rather than the page asked for."""
     head = html[:4000].lower()
@@ -90,31 +140,7 @@ class BrowserSession:
         return str(found[-1])
 
     def _start_display(self) -> None:
-        """Start Xvfb when there is no display.
-
-        A headless browser is refused, so the browser needs somewhere to draw.
-        xvfb-run would do it but needs xauth; driving Xvfb directly needs
-        neither.
-        """
-        if os.environ.get("DISPLAY"):
-            return
-        if not shutil.which("Xvfb"):
-            raise BrowserUnavailable("no DISPLAY and no Xvfb to start one")
-
-        self._xvfb = subprocess.Popen(
-            ["Xvfb", ":99", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        socket = pathlib.Path("/tmp/.X11-unix/X99")
-        for _ in range(50):
-            if socket.exists():
-                os.environ["DISPLAY"] = ":99"
-                log.info("  browser: started Xvfb on :99")
-                return
-            if self._xvfb.poll() is not None:
-                raise BrowserUnavailable("Xvfb exited before opening its socket")
-            time.sleep(0.1)
-        raise BrowserUnavailable("Xvfb never opened its socket")
+        self._xvfb = ensure_display()
 
     def _debug_port_open(self) -> bool:
         try:

@@ -32,6 +32,12 @@ WORKDIR /app
 # track a recent Chrome to keep Full-Time's WAF happy)
 RUN pip install --no-cache-dir curl_cffi==0.16.1 beautifulsoup4 playwright lxml boto3
 
+# Optional, and off unless RESULTS_SESSION names it: nodriver drives Chrome
+# without the attached-CDP pattern that Full-Time's challenge detects. Installed
+# so the choice is a environment variable rather than a rebuild; see
+# scraper/nodriver_session.py for what running it means.
+RUN pip install --no-cache-dir nodriver
+
 # Install Playwright browser binaries and their system dependencies
 RUN playwright install chromium --with-deps
 
