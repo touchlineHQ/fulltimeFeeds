@@ -6,12 +6,17 @@ FROM python:3.12-slim
 # headless Chromium on the pages carrying scores, so results need a real
 # browser session rather than a headless one.
 # x11vnc serves the virtual display over VNC, so a headless server can still
-# have a browser someone drives by hand — see scripts/vnc_browser.sh.
+# have a browser someone drives by hand — see scripts/vnc_browser.sh. novnc and
+# websockify put that same display behind a normal web page, because port 5900
+# speaks RFB rather than HTTP: pointing a browser straight at it gets nothing,
+# and a phone is unlikely to have a VNC client.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     xvfb \
     xauth \
     x11vnc \
+    novnc \
+    websockify \
     && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory inside the container

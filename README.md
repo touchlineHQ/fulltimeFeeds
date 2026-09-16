@@ -316,8 +316,11 @@ the same network:
 ```bash
 echo 'VNC_PASSWORD=something' >> .env
 docker compose run --rm --service-ports scraper scripts/vnc_browser.sh
-# then point a VNC client at <this-host>:5900
 ```
+
+Then open `http://<this-host>:6080/vnc.html` in any browser, a phone's included.
+Port 5900 is there as well for a native VNC client, but it speaks RFB rather
+than HTTP — a browser pointed straight at it sees nothing at all.
 
 The profile lives in the `scraper_state` volume, so whatever is done in it
 persists between runs. A password is required: this puts a browser on your

@@ -8,12 +8,16 @@
 #
 #   docker compose run --rm --service-ports scraper scripts/vnc_browser.sh
 #
-# Then point a VNC client at <this-host>:5900. The profile lives in /app/state,
-# so whatever you do in it — sign in, accept a prompt, complete a challenge —
-# is still there next time.
+# Then open http://<this-host>:6080/vnc.html in any browser — including a
+# phone's. Port 5900 is there too for a native VNC client, but it speaks RFB,
+# not HTTP, so a browser pointed at it sees nothing.
+#
+# The profile lives in /app/state, so whatever you do in it — sign in, accept a
+# prompt, complete a challenge — is still there next time.
 set -euo pipefail
 
 PORT="${VNC_PORT:-5900}"
+WEB_PORT="${VNC_WEB_PORT:-6080}"
 PROFILE="${FULLTIME_CHROME_PROFILE:-/app/state/chrome-profile}"
 URL="${1:-https://fulltime.thefa.com/}"
 SCREEN="${VNC_SCREEN:-1280x900x24}"
@@ -48,6 +52,19 @@ x11vnc -storepasswd "$VNC_PASSWORD" /tmp/.vncpass >/dev/null 2>&1
 x11vnc -display :99 -rfbport "$PORT" -rfbauth /tmp/.vncpass \
     -forever -shared -noxdamage >/dev/null 2>&1 &
 
+# Put the same display behind a web page, so any browser can reach it. The VNC
+# password still applies — websockify only relays the RFB stream.
+NOVNC_WEB=""
+for candidate in /usr/share/novnc /usr/share/webapps/novnc; do
+    [ -d "$candidate" ] && NOVNC_WEB="$candidate" && break
+done
+if [ -n "$NOVNC_WEB" ] && command -v websockify >/dev/null 2>&1; then
+    websockify --web="$NOVNC_WEB" "$WEB_PORT" "localhost:$PORT" >/dev/null 2>&1 &
+else
+    echo "novnc/websockify not in this image — rebuild for browser access." >&2
+    WEB_PORT=""
+fi
+
 mkdir -p "$PROFILE"
 WIDTH="${SCREEN%%x*}"; REST="${SCREEN#*x}"; HEIGHT="${REST%%x*}"
 "$CHROME" --user-data-dir="$PROFILE" --no-first-run --no-default-browser-check \
@@ -56,9 +73,13 @@ WIDTH="${SCREEN%%x*}"; REST="${SCREEN#*x}"; HEIGHT="${REST%%x*}"
 
 cat <<EOF
 
-  VNC is up on port $PORT — connect a VNC client to <this-host>:$PORT
-  using the password from VNC_PASSWORD.
+  In a web browser (works on a phone):
+    http://<this-host>:${WEB_PORT:-<rebuild for novnc>}/vnc.html
 
+  Or with a native VNC client:
+    <this-host>:$PORT       (RFB, not HTTP — a browser here shows nothing)
+
+  Password:        the one from VNC_PASSWORD
   Browser profile: $PROFILE (kept between runs)
   Opened:          $URL
 
