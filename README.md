@@ -299,12 +299,18 @@ Set `RESULTS_BROWSER=0` to keep a run to plain fetches only. If the browser is
 challenged too, `ResultsUnavailable` is raised as before and the feeds carry
 `results_unavailable`.
 
-Measured against the live site, that bundled browser is challenged too, from the
-same public IP as a phone that loads the page fine. What is left is that
-attaching over CDP is itself detectable — driving a page enables the debug
-protocol, and that is what the remaining detection keys on. Closing it means
-defeating the detection rather than working with it, which this project does
-not do.
+Measured against the live site, that bundled browser is challenged too. What
+that leaves is narrower than it looks, because the same image loads the page
+perfectly when a person drives it over VNC: same container, same binary, same
+virtual display, same public IP as a phone that also loads it. So the
+container's rendering, its font set and its address are all ruled out.
+
+The one difference between the run that works and the run that does not is that
+the automated one launches with `--remote-debugging-port` and attaches over CDP.
+Enabling the debug protocol is itself observable, and that is what the remaining
+detection keys on. Closing it means defeating the detection rather than working
+with it, which this project does not do — so results are unavailable to an
+unattended run, and the feeds say so rather than publishing an empty array.
 
 ### A browser on the server
 
