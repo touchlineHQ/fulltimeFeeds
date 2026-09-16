@@ -2,8 +2,13 @@
 FROM python:3.12-slim
 
 # Install Playwright system dependencies
+# xvfb + xauth let a headed browser run in the container: Cloudflare challenges
+# headless Chromium on the pages carrying scores, so results need a real
+# browser session rather than a headless one.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    xvfb \
+    xauth \
     && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory inside the container

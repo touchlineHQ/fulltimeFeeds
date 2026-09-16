@@ -26,7 +26,10 @@ Or inside the container, where headed modes need a virtual display:
 import argparse
 import os
 import pathlib
+import shutil
+import subprocess
 import sys
+import time
 import traceback
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scraper"))
@@ -37,6 +40,38 @@ DEFAULT_SEASON = "918978398"
 ROW_SELECTOR = "td.home-team"
 # Cloudflare's interstitial can take several seconds to clear itself.
 SETTLE_MS = 25_000
+
+
+def start_virtual_display() -> subprocess.Popen | None:
+    """Start Xvfb and point DISPLAY at it, so headed modes can run headless-ly.
+
+    xvfb-run would do this, but it needs xauth, which the slim image does not
+    carry. Driving Xvfb directly needs neither.
+    """
+    if os.environ.get("DISPLAY"):
+        return None
+    if not shutil.which("Xvfb"):
+        print("No DISPLAY and no Xvfb — headed modes will be skipped.\n")
+        return None
+
+    proc = subprocess.Popen(
+        ["Xvfb", ":99", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    socket = pathlib.Path("/tmp/.X11-unix/X99")
+    for _ in range(50):                       # up to 5s for the socket to appear
+        if socket.exists():
+            os.environ["DISPLAY"] = ":99"
+            print("Started Xvfb on :99 for the headed modes.\n")
+            return proc
+        if proc.poll() is not None:
+            print("Xvfb exited immediately — headed modes will be skipped.\n")
+            return None
+        time.sleep(0.1)
+
+    proc.terminate()
+    print("Xvfb never opened its socket — headed modes will be skipped.\n")
+    return None
 
 
 def verdict(html: str) -> str:
@@ -109,8 +144,9 @@ def main() -> int:
 
     url = f"{scrape.RESULTS_URL}?selectedSeason={args.season}&selectedFixtureGroupKey="
     print(f"target: {url}")
+    xvfb = start_virtual_display()
     display = os.environ.get("DISPLAY")
-    print(f"DISPLAY={display or '(unset — headed modes will fail; use xvfb-run)'}\n")
+    print(f"DISPLAY={display or '(unset — headed modes skipped)'}\n")
 
     results: list[tuple[str, str]] = []
     good_cookies: list[dict] | None = None
@@ -156,6 +192,8 @@ def main() -> int:
     for label, out in results:
         print(f"  {out.split(' ')[0]:12} {label}")
     print("\nBuild on whichever mode reports OK.")
+    if xvfb:
+        xvfb.terminate()
     return 0
 
 
