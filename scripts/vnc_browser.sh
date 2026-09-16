@@ -120,7 +120,25 @@ for candidate in /usr/share/novnc /usr/share/webapps/novnc; do
     [ -d "$candidate" ] && NOVNC_WEB="$candidate" && break
 done
 if [ -n "$NOVNC_WEB" ] && command -v websockify >/dev/null 2>&1; then
-    websockify --web="$NOVNC_WEB" "$WEB_PORT" "localhost:$PORT" >/dev/null 2>&1 &
+    websockify --web="$NOVNC_WEB" "$WEB_PORT" "localhost:$PORT" >/tmp/websockify.log 2>&1 &
+    WEBSOCKIFY_PID=$!
+    # Check it is serving rather than assuming: a port that never opened looks
+    # exactly like a page that will not load.
+    NOVNC_OK=""
+    for _ in $(seq 1 20); do
+        if curl -sf -o /dev/null "http://localhost:$WEB_PORT/vnc.html"; then
+            NOVNC_OK=1
+            break
+        fi
+        kill -0 "$WEBSOCKIFY_PID" 2>/dev/null || break
+        sleep 0.5
+    done
+    if [ -z "$NOVNC_OK" ]; then
+        echo "websockify is not serving on $WEB_PORT. Its output:" >&2
+        tail -20 /tmp/websockify.log >&2
+        echo "The native VNC port $PORT should still work." >&2
+        WEB_PORT=""
+    fi
 else
     echo "novnc/websockify not in this image — rebuild for browser access." >&2
     WEB_PORT=""
@@ -170,14 +188,19 @@ sleep 3
 if ! kill -0 "$CHROME_PID" 2>/dev/null; then
     echo "The browser exited immediately. Its output:" >&2
     tail -20 /tmp/chrome.log >&2
-    exit 1
+    echo >&2
+    echo "Leaving the session up so you can look — there is a terminal in it." >&2
+    BROWSER_FAILED=1
 fi
 
 # Save each results tab as it finishes loading, so the pages do not have to be
 # saved by hand one at a time.
-if [ "${VNC_AUTOSAVE:-1}" != "0" ]; then
+AUTOSAVE_STATE="off (VNC_AUTOSAVE=0) — save by hand with Ctrl+S into $SAVE_DIR"
+if [ "${VNC_AUTOSAVE:-1}" != "0" ] && [ -z "${BROWSER_FAILED:-}" ]; then
+    AUTOSAVE_STATE="into $SAVE_DIR as each tab finishes loading"
     RESULTS_HTML_DIR="$SAVE_DIR" python3 "$(dirname "$0")/save_open_tabs.py" \
-        --endpoint "http://localhost:$CDP_PORT" --watch &
+        --endpoint "http://localhost:$CDP_PORT" --watch \
+        || echo "Tab saving stopped; the session is unaffected." >&2 &
 fi
 
 cat <<EOF
@@ -192,9 +215,8 @@ cat <<EOF
                    (VNC truncates to 8 characters — this is what to type)
   Browser profile: $PROFILE (kept between runs)
   Tabs opened:     ${#URLS[@]} (one results page per configured league)
-  Saving to:       $SAVE_DIR, automatically, as each tab finishes loading
-                   (clear any challenge shown and it is picked up next pass;
-                    set VNC_AUTOSAVE=0 to save by hand with Ctrl+S instead)
+  Browser:         ${BROWSER_FAILED:+FAILED TO START — see above}${BROWSER_FAILED:-running}
+  Saving tabs:     ${AUTOSAVE_STATE}
 
   Ctrl-C here when you are done.
 
