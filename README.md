@@ -319,6 +319,9 @@ docker compose run --rm --service-ports scraper scripts/vnc_browser.sh
 ```
 
 Then open `http://<this-host>:6080/vnc.html` in any browser, a phone's included.
+The session comes up with a window manager, a terminal, and browser tabs already
+open on the pages worth looking at, so nothing has to be typed into a remote
+browser from a phone.
 Port 5900 is there as well for a native VNC client, but it speaks RFB rather
 than HTTP — a browser pointed straight at it sees nothing at all.
 

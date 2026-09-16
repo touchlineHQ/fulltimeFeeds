@@ -10,6 +10,10 @@ FROM python:3.12-slim
 # websockify put that same display behind a normal web page, because port 5900
 # speaks RFB rather than HTTP: pointing a browser straight at it gets nothing,
 # and a phone is unlikely to have a VNC client.
+#
+# openbox is not decoration: with no window manager on the display, an
+# application window is not mapped and the VNC session shows an empty screen.
+# xterm gives a terminal in that session, for a machine reached from a phone.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     xvfb \
@@ -17,6 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     x11vnc \
     novnc \
     websockify \
+    openbox \
+    xterm \
     && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory inside the container

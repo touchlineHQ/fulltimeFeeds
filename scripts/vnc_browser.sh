@@ -48,8 +48,13 @@ for binary in Xvfb x11vnc; do
     }
 done
 
-CHROME="$(find "${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}" \
-    -name chrome -path '*chrome-linux*' 2>/dev/null | sort | tail -1)"
+CHROME=""
+for root in "${PLAYWRIGHT_BROWSERS_PATH:-}" "$HOME/.cache/ms-playwright" \
+            /root/.cache/ms-playwright /opt/pw-browsers; do
+    [ -n "$root" ] && [ -d "$root" ] || continue
+    CHROME="$(find "$root" -name chrome -path '*chrome-linux*' 2>/dev/null | sort | tail -1)"
+    [ -n "$CHROME" ] && break
+done
 [ -n "$CHROME" ] || { echo "No chromium in this image." >&2; exit 1; }
 
 cleanup() { kill $(jobs -p) 2>/dev/null || true; }
@@ -101,11 +106,34 @@ else
     WEB_PORT=""
 fi
 
+# Without a window manager the browser's window is never mapped and the VNC
+# session shows nothing at all — which looks exactly like a browser that failed
+# to start.
+if command -v openbox >/dev/null 2>&1; then
+    openbox >/tmp/openbox.log 2>&1 &
+    sleep 1
+else
+    echo "NOTE: no window manager in this image (rebuild) — the screen may stay blank." >&2
+fi
+
+# A terminal in the session, for when the only device to hand is a phone.
+if command -v xterm >/dev/null 2>&1; then
+    xterm -geometry 100x24+0+600 -fa Monospace -fs 10 >/tmp/xterm.log 2>&1 &
+fi
+
 mkdir -p "$PROFILE"
 WIDTH="${SCREEN%%x*}"; REST="${SCREEN#*x}"; HEIGHT="${REST%%x*}"
 "$CHROME" --user-data-dir="$PROFILE" --no-first-run --no-default-browser-check \
     --no-sandbox --window-size="$WIDTH,$HEIGHT" --window-position=0,0 \
-    "${URLS[@]}" >/dev/null 2>&1 &
+    "${URLS[@]}" >/tmp/chrome.log 2>&1 &
+CHROME_PID=$!
+
+sleep 3
+if ! kill -0 "$CHROME_PID" 2>/dev/null; then
+    echo "The browser exited immediately. Its output:" >&2
+    tail -20 /tmp/chrome.log >&2
+    exit 1
+fi
 
 cat <<EOF
 
