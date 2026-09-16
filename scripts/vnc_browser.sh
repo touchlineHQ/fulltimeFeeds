@@ -122,6 +122,23 @@ if command -v xterm >/dev/null 2>&1; then
 fi
 
 mkdir -p "$PROFILE"
+
+# Chromium records the hostname and pid holding a profile in these files, and
+# refuses to start when they name someone else. Every `docker compose run` gets
+# a fresh container hostname, so a profile kept in a volume always looks held by
+# "another computer" after the first run — and a browser killed with the
+# container never gets to clean them up. Nothing else can be using the profile
+# here: this container just started, and it starts exactly one browser.
+for lock in SingletonLock SingletonCookie SingletonSocket; do
+    # -e alone is not enough: SingletonLock is a symlink to "hostname-pid",
+    # which is not a real path, so a dangling link tests false and survives.
+    if [ -e "$PROFILE/$lock" ] || [ -L "$PROFILE/$lock" ]; then
+        rm -f "$PROFILE/$lock"
+        CLEARED_LOCKS=1
+    fi
+done
+[ -n "${CLEARED_LOCKS:-}" ] && echo "Cleared a stale profile lock from an earlier run."
+
 WIDTH="${SCREEN%%x*}"; REST="${SCREEN#*x}"; HEIGHT="${REST%%x*}"
 "$CHROME" --user-data-dir="$PROFILE" --no-first-run --no-default-browser-check \
     --no-sandbox --window-size="$WIDTH,$HEIGHT" --window-position=0,0 \
