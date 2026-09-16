@@ -72,6 +72,12 @@ HTTP_RETRIES = 5
 HTTP_BACKOFF_FACTOR = 2  # waits 2s, 4s, 8s, 16s, 32s between retries (+ jitter)
 HTTP_TIMEOUT = 90  # seconds
 
+# Statuses that mean "refused", not "try again": backing off five times over
+# half a minute does not change a WAF's mind, and on the results page it only
+# delays the browser fallback. One retry still covers an intermittent block.
+REFUSAL_CODES = frozenset({401, 403, 404, 410})
+REFUSAL_RETRIES = 2
+
 # Cloudflare challenges automated clients on the pages carrying scores, and
 # every Playwright mode — headless, --headless=new, headed, headed with a
 # persistent profile — is detected just the same, because Playwright exposes
@@ -157,7 +163,10 @@ class Result(NamedTuple):
 def _fetch_page(url: str, label: str) -> str:
     """Fetch a URL with retries and browser impersonation. Returns response text."""
     last_err: Exception | None = None
-    for attempt in range(1, HTTP_RETRIES + 1):
+    limit = HTTP_RETRIES
+    attempt = 0
+    while attempt < limit:
+        attempt += 1
         try:
             with curl_requests.Session(impersonate="chrome") as session:
                 session.headers.update(BROWSER_HEADERS)
@@ -169,22 +178,28 @@ def _fetch_page(url: str, label: str) -> str:
                 for name, value in _session_cookies().items():
                     session.cookies.set(name, value, domain=".thefa.com")
                 resp = session.get(url, timeout=HTTP_TIMEOUT)
+                # A refusal is a decision, not a hiccup. Full-Time does block
+                # intermittently, so one retry earns its keep, but five rounds
+                # of backoff against a settled "no" just delay the fallback
+                # that might actually work — ~34s per league, every run.
+                if resp.status_code in REFUSAL_CODES:
+                    limit = min(limit, REFUSAL_RETRIES)
                 resp.raise_for_status()
                 return resp.text
         except Exception as e:
             last_err = e
-            if attempt < HTTP_RETRIES:
+            if attempt < limit:
                 # Jittered exponential backoff so repeated daily runs don't
                 # present an identical, bot-shaped retry cadence to the WAF.
                 wait = HTTP_BACKOFF_FACTOR * (2 ** (attempt - 1))
                 wait *= 1 + random.uniform(0, 0.25)
                 log.warning(
-                    f"{label} attempt {attempt}/{HTTP_RETRIES} failed: {e} "
+                    f"{label} attempt {attempt}/{limit} failed: {e} "
                     f"— retrying in {wait:.1f}s"
                 )
                 time.sleep(wait)
             else:
-                log.error(f"{label} all {HTTP_RETRIES} attempts failed: {e}")
+                log.error(f"{label} gave up after {attempt} attempt(s): {e}")
 
     raise last_err  # type: ignore[misc]
 

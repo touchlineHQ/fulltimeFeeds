@@ -1103,3 +1103,88 @@ class TestResultsBrowserSwitch:
         with pytest.raises(RuntimeError, match="scrape blew up"):
             scrape.main()
         assert closed == [True]
+
+
+# ---------------------------------------------------------------------------
+# _fetch_page — a refusal is not retried like a transient failure
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, status_code, text="body"):
+        self.status_code = status_code
+        self.text = text
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP Error {self.status_code}: ")
+
+
+class _FakeSession:
+    """Mimics curl_cffi's Session for the retry loop only."""
+
+    def __init__(self, responses, attempts):
+        self._responses = responses
+        self._attempts = attempts
+        self.headers = {}
+        self.cookies = type("Jar", (), {"set": lambda *a, **k: None})()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, timeout=None):
+        self._attempts.append(url)
+        index = min(len(self._attempts) - 1, len(self._responses) - 1)
+        return self._responses[index]
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    monkeypatch.setattr(scrape.time, "sleep", lambda s: None)
+
+
+class TestFetchPageRetries:
+
+    @staticmethod
+    def _install(monkeypatch, responses, attempts):
+        monkeypatch.setattr(
+            scrape.curl_requests, "Session",
+            lambda **kw: _FakeSession(responses, attempts),
+        )
+
+    def test_a_refusal_is_tried_twice_not_five_times(self, monkeypatch, no_sleep):
+        attempts = []
+        self._install(monkeypatch, [_FakeResponse(403)], attempts)
+
+        with pytest.raises(RuntimeError, match="403"):
+            scrape._fetch_page("https://example.test/results", "results")
+
+        assert len(attempts) == scrape.REFUSAL_RETRIES == 2
+
+    def test_a_transient_failure_still_gets_the_full_budget(self, monkeypatch, no_sleep):
+        attempts = []
+        self._install(monkeypatch, [_FakeResponse(503)], attempts)
+
+        with pytest.raises(RuntimeError, match="503"):
+            scrape._fetch_page("https://example.test/results", "results")
+
+        assert len(attempts) == scrape.HTTP_RETRIES == 5
+
+    def test_an_intermittent_refusal_is_still_recovered(self, monkeypatch, no_sleep):
+        # One retry is the point of not cutting straight to a single attempt.
+        attempts = []
+        self._install(
+            monkeypatch, [_FakeResponse(403), _FakeResponse(200, "rows")], attempts
+        )
+
+        assert scrape._fetch_page("https://example.test/results", "results") == "rows"
+        assert len(attempts) == 2
+
+    def test_success_first_time_makes_one_request(self, monkeypatch, no_sleep):
+        attempts = []
+        self._install(monkeypatch, [_FakeResponse(200, "rows")], attempts)
+
+        assert scrape._fetch_page("https://example.test/f", "fixtures") == "rows"
+        assert len(attempts) == 1
