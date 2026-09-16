@@ -24,6 +24,8 @@ SCREEN="${VNC_SCREEN:-1280x900x24}"
 
 if [ -z "${VNC_PASSWORD:-}" ]; then
     echo "Set VNC_PASSWORD (in .env) before starting." >&2
+    echo "Note: docker compose treats an unquoted # in .env as a comment, so" >&2
+    echo "quote the value if it contains one: VNC_PASSWORD='pa#ssword'" >&2
     echo "This puts a browser on your network; an unauthenticated one is a" >&2
     echo "browser anybody on that network can drive." >&2
     exit 1
@@ -48,9 +50,33 @@ for _ in $(seq 1 50); do [ -e /tmp/.X11-unix/X99 ] && break; sleep 0.1; done
 [ -e /tmp/.X11-unix/X99 ] || { echo "Xvfb did not start." >&2; exit 1; }
 export DISPLAY=:99
 
-x11vnc -storepasswd "$VNC_PASSWORD" /tmp/.vncpass >/dev/null 2>&1
+# RFB passwords are DES-based and truncate at 8 characters, silently: a longer
+# one is stored as its first 8, and what you type will not match. Truncate here
+# so the password that works is the one printed below.
+VNC_SECRET="${VNC_PASSWORD:0:8}"
+if [ "${#VNC_PASSWORD}" -gt 8 ]; then
+    echo "NOTE: VNC passwords are limited to 8 characters by the protocol."
+    echo "      Using the first 8 of VNC_PASSWORD: '$VNC_SECRET'"
+    echo
+fi
+
+if ! x11vnc -storepasswd "$VNC_SECRET" /tmp/.vncpass >/tmp/storepasswd.log 2>&1; then
+    echo "Could not store the VNC password:" >&2
+    cat /tmp/storepasswd.log >&2
+    exit 1
+fi
+[ -s /tmp/.vncpass ] || { echo "Password file is empty — refusing to start." >&2; exit 1; }
+
 x11vnc -display :99 -rfbport "$PORT" -rfbauth /tmp/.vncpass \
-    -forever -shared -noxdamage >/dev/null 2>&1 &
+    -forever -shared -noxdamage >/tmp/x11vnc.log 2>&1 &
+X11VNC_PID=$!
+
+sleep 2
+if ! kill -0 "$X11VNC_PID" 2>/dev/null; then
+    echo "x11vnc exited immediately:" >&2
+    tail -20 /tmp/x11vnc.log >&2
+    exit 1
+fi
 
 # Put the same display behind a web page, so any browser can reach it. The VNC
 # password still applies — websockify only relays the RFB stream.
@@ -79,7 +105,8 @@ cat <<EOF
   Or with a native VNC client:
     <this-host>:$PORT       (RFB, not HTTP — a browser here shows nothing)
 
-  Password:        the one from VNC_PASSWORD
+  Password:        $VNC_SECRET
+                   (VNC truncates to 8 characters — this is what to type)
   Browser profile: $PROFILE (kept between runs)
   Opened:          $URL
 
