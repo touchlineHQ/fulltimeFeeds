@@ -34,6 +34,53 @@ ROW_MARKER = "home-team"
 # starting up" look identical otherwise.
 STATUS_EVERY = 30.0
 _last_status = 0.0
+_passes = 0
+
+# Playwright waits 30s by default before giving up on a page. Across seven tabs
+# that is minutes of silence before anything is printed, which reads as a hang.
+# A tab that cannot be read in a few seconds is not ready anyway.
+TAB_TIMEOUT_MS = 5_000
+
+# One connection, reused: starting a driver and attaching for every poll costs
+# seconds a time and is the slowest part of the loop by far.
+_connection = None
+
+
+def _connected(endpoint: str):
+    """The browser at *endpoint*, reconnecting if the connection has dropped."""
+    global _connection
+    if _connection is not None:
+        _, browser = _connection
+        try:
+            if browser.is_connected():
+                return browser
+        except Exception:
+            pass
+        _disconnect()
+
+    from playwright.sync_api import sync_playwright
+
+    pw = sync_playwright().start()
+    try:
+        browser = pw.chromium.connect_over_cdp(endpoint, timeout=15_000)
+    except Exception:
+        pw.stop()
+        raise
+    _connection = (pw, browser)
+    return browser
+
+
+def _disconnect() -> None:
+    global _connection
+    if _connection is None:
+        return
+    pw, browser = _connection
+    _connection = None
+    for shut in (browser.close, pw.stop):
+        try:
+            shut()
+        except Exception:
+            pass
 
 
 def league_names() -> dict[str, str]:
@@ -46,40 +93,43 @@ def open_results_tabs(endpoint: str) -> list[tuple[str, str, str]]:
     Reads only. Playwright is used to talk to the browser already running, not
     to start or steer one.
     """
-    from playwright.sync_api import sync_playwright
-
     found: list[tuple[str, str, str]] = []
-    pw = sync_playwright().start()
-    try:
-        browser = pw.chromium.connect_over_cdp(endpoint)
-        for context in browser.contexts:
-            for page in context.pages:
-                url = page.url
-                if "/results/" not in url:
-                    continue
-                season = SEASON_RE.search(url)
-                if not season:
-                    continue
-                try:
-                    html = page.content()
-                except Exception as e:                  # a tab mid-load
-                    log.debug(f"  could not read {url}: {e}")
-                    continue
-                found.append((season.group(1), url, html))
+    browser = _connected(endpoint)
+    total = 0
 
-        if not found:
-            _report_idle(sum(len(c.pages) for c in browser.contexts))
-        browser.close()
-    finally:
-        pw.stop()
+    for context in browser.contexts:
+        for page in context.pages:
+            total += 1
+            url = page.url
+            if "/results/" not in url:
+                continue
+            season = SEASON_RE.search(url)
+            if not season:
+                continue
+            try:
+                page.set_default_timeout(TAB_TIMEOUT_MS)
+                html = page.content()
+            except Exception as e:              # still loading, or mid-navigation
+                log.debug(f"  could not read {url}: {e}")
+                continue
+            found.append((season.group(1), url, html))
+
+    if not found:
+        _report_idle(total)
     return found
 
 
 def _report_idle(open_tabs: int) -> None:
-    """Say why nothing is being saved, occasionally rather than every pass."""
-    global _last_status
+    """Say why nothing is being saved.
+
+    Every pass to begin with, so there is feedback immediately, then
+    occasionally — at a five second poll, saying it every time would be twelve
+    lines a minute of nothing new.
+    """
+    global _last_status, _passes
+    _passes += 1
     now = time.time()
-    if now - _last_status < STATUS_EVERY:
+    if _passes > 3 and now - _last_status < STATUS_EVERY:
         return
     _last_status = now
     if open_tabs:
@@ -157,6 +207,8 @@ def main() -> int:
             time.sleep(args.interval)
     except KeyboardInterrupt:
         log.info("\nStopped.")
+    finally:
+        _disconnect()
 
     log.info(f"\n{len(saved)} of {total_leagues} league(s) saved to {out_dir}")
     if saved:
