@@ -26,7 +26,19 @@ log = logging.getLogger(__name__)
 # Cloudflare shows two pages and they mean opposite things: a refusal, and a
 # challenge it expects a browser to solve.
 BLOCK_MARKERS = ("attention required",)
-CHALLENGE_MARKERS = ("just a moment", "checking your browser", "cf-challenge")
+# "just a moment" is the visible title, but it is not always near the top of a
+# challenge page; the challenge-platform script tag and the __cf_chl token are
+# on every one of them and are what make this reliable.
+CHALLENGE_MARKERS = (
+    "just a moment",
+    "checking your browser",
+    "cf-challenge",
+    "cdn-cgi/challenge-platform",
+    "__cf_chl",
+)
+# How much of a page to look at. A challenge page can carry a lot of inline
+# script before anything identifying it.
+INSPECT_CHARS = 8_000
 
 DEFAULT_PORT = 9222
 DEFAULT_PROFILE = "/tmp/fulltime-browser"
@@ -90,7 +102,7 @@ def find_chromium() -> str:
 
 def is_challenge_page(html: str) -> bool:
     """True when a response is an interstitial rather than the page asked for."""
-    head = html[:4000].lower()
+    head = html[:INSPECT_CHARS].lower()
     return any(m in head for m in BLOCK_MARKERS + CHALLENGE_MARKERS)
 
 

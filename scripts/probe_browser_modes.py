@@ -78,12 +78,11 @@ def start_virtual_display() -> subprocess.Popen | None:
 # "Attention Required!" is a refusal. "Just a moment..." is a challenge being
 # offered — a browser is expected to solve it and be given a cf_clearance
 # cookie. Reaching the second from the first is progress, not failure.
-BLOCK_MARKERS = ("attention required",)
-CHALLENGE_MARKERS = ("just a moment", "checking your browser", "cf-challenge")
+from browser import BLOCK_MARKERS, CHALLENGE_MARKERS, INSPECT_CHARS  # noqa: E402
 
 
 def challenge_state(html: str) -> str | None:
-    head = html[:4000].lower()
+    head = html[:INSPECT_CHARS].lower()
     if any(m in head for m in BLOCK_MARKERS):
         return "BLOCKED (refused outright)"
     if any(m in head for m in CHALLENGE_MARKERS):

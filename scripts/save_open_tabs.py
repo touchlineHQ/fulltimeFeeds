@@ -133,6 +133,13 @@ def open_results_tabs(endpoint: str) -> list[tuple[str, str, str]]:
             continue
         try:
             html = _page_html(ws_url)
+        except ImportError as e:
+            # A missing dependency is not a busy tab. Swallowed as a per-tab
+            # debug line it looks exactly like "nothing to save", forever.
+            raise RuntimeError(
+                f"{e} — rebuild the image (`docker compose build`) so "
+                f"websocket-client is installed"
+            ) from e
         except Exception as e:                  # still loading, or busy
             log.debug(f"  could not read {url}: {e}")
             continue

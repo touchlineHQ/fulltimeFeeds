@@ -29,12 +29,26 @@ class TestIsChallengePage:
     def test_real_pages_are_not(self, html):
         assert is_challenge_page(html) is False
 
-    def test_only_the_head_of_the_page_is_considered(self):
+    def test_only_the_start_of_the_page_is_considered(self):
         # A results page that happens to name a team "Just a moment" deep in
         # the body is not an interstitial.
-        html = "<html><td class='home-team'>x</td>" + ("y" * 5000) + "just a moment</html>"
+        from browser import INSPECT_CHARS
+
+        html = ("<html><td class='home-team'>x</td>"
+                + ("y" * (INSPECT_CHARS + 1000)) + "just a moment</html>")
 
         assert is_challenge_page(html) is False
+
+    @pytest.mark.parametrize("marker", [
+        '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/jsch/v1"></script>',
+        '<input type="hidden" name="__cf_chl_tk" value="abc">',
+    ])
+    def test_cloudflares_own_markers_are_recognised(self, marker):
+        # The visible "Just a moment" title is not always near the top of the
+        # document; these are on every challenge page.
+        html = "<html><head>" + ("<!-- padding -->" * 100) + marker + "</head></html>"
+
+        assert is_challenge_page(html) is True
 
 
 class TestStartDisplay:
