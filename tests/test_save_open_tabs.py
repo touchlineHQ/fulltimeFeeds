@@ -262,3 +262,54 @@ class TestDirectCdp:
         monkeypatch.setitem(module, "_page_html", lambda ws, timeout=None: "<html></html>")
 
         assert module["open_results_tabs"]("http://localhost:9222") == []
+
+
+class TestUnloadedTabs:
+    """Chrome leaves a background tab empty until it is visited."""
+
+    @pytest.mark.parametrize("html", [
+        "<html><head></head><body></body></html>",
+        "<html><head></head><body></body></html>\n",
+        "  <html>\n  <head></head>\n  <body></body>\n</html>  ",
+        "",
+    ])
+    def test_an_empty_document_is_recognised(self, module, html):
+        assert module["is_unloaded"](html) is True
+
+    @pytest.mark.parametrize("html", [
+        "<html><body><p>No results found</p></body></html>",
+        "<html><head><title>Just a moment...</title></head><body></body></html>",
+        "<html><body><table><tr><td class='home-team'>A</td></tr></table></body></html>",
+    ])
+    def test_a_page_with_anything_in_it_is_not(self, module, html):
+        assert module["is_unloaded"](html) is False
+
+    def test_an_unloaded_tab_is_reported_as_such(self, module, tmp_path, monkeypatch, caplog):
+        # "no results on the page" sent someone looking for a scraping fault
+        # when the tab simply had not been opened.
+        monkeypatch.setitem(
+            module, "open_results_tabs",
+            lambda endpoint: [
+                ("918978398", _url("918978398"), "<html><head></head><body></body></html>"),
+            ],
+        )
+
+        with caplog.at_level("INFO", logger="save_open_tabs"):
+            written = module["save_ready_tabs"]("http://x", tmp_path, set())
+
+        assert written == 0
+        assert "click it in the browser" in caplog.text
+
+    def test_a_loaded_page_without_results_says_something_different(
+        self, module, tmp_path, monkeypatch, caplog
+    ):
+        monkeypatch.setitem(
+            module, "open_results_tabs",
+            lambda endpoint: [("918978398", _url("918978398"), EMPTY)],
+        )
+
+        with caplog.at_level("INFO", logger="save_open_tabs"):
+            module["save_ready_tabs"]("http://x", tmp_path, set())
+
+        assert "may not have played" in caplog.text
+        assert "click it in the browser" not in caplog.text

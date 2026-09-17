@@ -31,6 +31,17 @@ log = logging.getLogger("save_open_tabs")
 
 SEASON_RE = re.compile(r"selectedSeason=(\d+)")
 ROW_MARKER = "home-team"
+# Chrome does not load a tab opened in the background until it is visited, so an
+# unvisited tab answers with an empty document: <html><head></head><body></body>
+# </html> and nothing else. That is a different problem from a page that loaded
+# and held nothing, and needs different advice, so match the shell itself rather
+# than guess from the length.
+_SHELL_RE = re.compile(r"</?(?:html|head|body)[^>]*>|\s+", re.IGNORECASE)
+
+
+def is_unloaded(html: str) -> bool:
+    """True for the empty document a tab that was never visited returns."""
+    return not _SHELL_RE.sub("", html)
 # How often to say what is going on when nothing is ready. Silence and "still
 # starting up" look identical otherwise.
 STATUS_EVERY = 30.0
@@ -57,7 +68,7 @@ def _targets(endpoint: str) -> list[dict]:
     """Every tab the browser has open, from the debug port's HTTP listing."""
     import urllib.request
 
-    with urllib.request.urlopen(f"{endpoint}/json/list", timeout=5) as response:
+    with urllib.request.urlopen(f"{endpoint}/json/list", timeout=15) as response:
         return [t for t in json.loads(response.read()) if t.get("type") == "page"]
 
 
@@ -163,11 +174,16 @@ def save_ready_tabs(endpoint: str, out_dir: pathlib.Path, saved: set[str]) -> in
             continue
         label = names.get(season_id, f"season {season_id}")
 
+        if is_unloaded(html):
+            log.info(f"  {label}: tab not loaded yet — click it in the browser "
+                     f"(Chrome loads a background tab only when you visit it)")
+            continue
         if is_challenge_page(html):
             log.info(f"  {label}: still showing a challenge — solve it in the browser")
             continue
         if ROW_MARKER not in html:
-            log.info(f"  {label}: no results on the page yet")
+            log.info(f"  {label}: loaded, but holds no results table "
+                     f"(this league may not have played yet)")
             continue
 
         destination = out_dir / f"{season_id}.html"
@@ -202,6 +218,7 @@ def main() -> int:
     log.info(f"Saving results tabs into {out_dir}\n")
 
     saved: set[str] = set()
+    misses = 0
     total_leagues = len(scrape.LEAGUES)
     log.info(f"Watching for {total_leagues} league(s) at {args.endpoint}")
 
@@ -209,8 +226,16 @@ def main() -> int:
         while True:
             try:
                 save_ready_tabs(args.endpoint, out_dir, saved)
+                misses = 0
             except Exception as e:
-                log.warning(f"Could not read the browser at {args.endpoint}: {e}")
+                # A browser loading seven pages is sometimes too busy to answer
+                # its own debug port. Worth saying once, not every pass.
+                misses += 1
+                if misses == 1 or misses % 12 == 0:
+                    log.warning(
+                        f"Could not read the browser at {args.endpoint}: {e}"
+                        + (" (still trying)" if args.watch else "")
+                    )
                 if not args.watch:
                     return 1
 

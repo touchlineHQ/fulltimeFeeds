@@ -372,6 +372,11 @@ waiting for each to answer, so a single tab sitting on a challenge stalls the
 connection to all of them. Listing tabs over HTTP and reading each through its
 own websocket means an unresponsive tab costs only its own five second timeout.
 
+Chrome does not load a tab opened in the background until it is visited, so
+click through the tabs once in noVNC: an unvisited tab answers with an empty
+document and is reported as `tab not loaded yet`, distinct from one that loaded
+and held no results.
+
 Set `VNC_AUTOSAVE=0` to turn it off and save tabs by hand with `Ctrl+S` instead;
 filenames do not matter then, since each page names its own season in the links
 it renders.
