@@ -153,27 +153,28 @@ class TestIdleReporting:
 
         assert "no tabs open" in caplog.text
 
-    def test_the_first_few_passes_report_immediately(self, module, caplog):
+    def test_the_first_few_passes_report_immediately(self, module, caplog, monkeypatch):
+        monkeypatch.setitem(module, "_passes", 0)
         # Waiting thirty seconds for the first word is indistinguishable from a
         # hang, which is the thing this exists to rule out.
         module["_last_status"] = 0.0
-        module["_passes"] = 0
 
         with caplog.at_level("INFO", logger="save_open_tabs"):
-            module["_report_idle"](7)
-            module["_report_idle"](7)
-            module["_report_idle"](7)
+            for _ in range(3):
+                module["_passes"] += 1
+                module["_report_idle"](7)
 
         assert caplog.text.count("tab(s) open") == 3
 
     def test_then_it_settles_down(self, module, caplog):
         # At a five second poll, every pass would be twelve lines a minute of
-        # nothing new.
+        # nothing new. _passes is advanced by the caller, so drive it here too.
         module["_last_status"] = 0.0
         module["_passes"] = 0
 
         with caplog.at_level("INFO", logger="save_open_tabs"):
             for _ in range(10):
+                module["_passes"] += 1
                 module["_report_idle"](7)
 
         assert caplog.text.count("tab(s) open") == 3

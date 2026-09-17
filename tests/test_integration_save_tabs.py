@@ -272,3 +272,33 @@ def _reload(endpoint: str, season: str) -> None:
     finally:
         connection.close()
     time.sleep(1)
+
+
+class TestReadingMechanisms:
+    """Both ways of asking a tab for its HTML must work against a real browser."""
+
+    def test_dom_fallback_returns_the_same_document(self, module, live_browser):
+        import websocket
+
+        targets = json.loads(
+            urllib.request.urlopen(f"{live_browser}/json/list", timeout=5).read()
+        )
+        page = next(t for t in targets if "/results/" in t.get("url", ""))
+        ws_url = page["webSocketDebuggerUrl"]
+
+        via_evaluate = module["_page_html"](ws_url)
+        assert "home-team-col" in via_evaluate
+
+        connection = websocket.create_connection(ws_url, timeout=10, suppress_origin=True)
+        try:
+            document = module["_call"](connection, 2, "DOM.getDocument", {"depth": 0}, 10)
+            node_id = document["result"]["root"]["nodeId"]
+            outer = module["_call"](
+                connection, 3, "DOM.getOuterHTML", {"nodeId": node_id}, 10
+            )
+            via_dom = outer["result"]["outerHTML"]
+        finally:
+            connection.close()
+
+        assert "home-team-col" in via_dom
+        assert len(scrape.parse_results(via_dom)) == len(scrape.parse_results(via_evaluate))

@@ -80,11 +80,27 @@ def _targets(endpoint: str) -> list[dict]:
         return [t for t in json.loads(response.read()) if t.get("type") == "page"]
 
 
+def _call(connection, call_id: int, method: str, params: dict, timeout: float) -> dict:
+    """Send one CDP call and return its reply, stepping over events."""
+    connection.send(json.dumps({"id": call_id, "method": method, "params": params}))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        message = json.loads(connection.recv())
+        if message.get("id") == call_id:
+            return message
+    raise TimeoutError(f"no reply to {method}")
+
+
 def _page_html(ws_url: str, timeout: float = TAB_TIMEOUT) -> str:
     """Ask one tab for its rendered HTML, over its own websocket.
 
     Nothing is navigated or reloaded: this reads the document already on
     screen, which is what the person driving the browser fetched.
+
+    Two ways of asking, because they fail differently. Runtime.evaluate runs in
+    the page's own world and can come back empty while a page is mid
+    navigation; DOM.getOuterHTML goes through the inspector's own view of the
+    document and answers when the first does not.
     """
     import websocket  # websocket-client
 
@@ -93,22 +109,27 @@ def _page_html(ws_url: str, timeout: float = TAB_TIMEOUT) -> str:
         ws_url, timeout=timeout, suppress_origin=True
     )
     try:
-        connection.send(json.dumps({
-            "id": 1,
-            "method": "Runtime.evaluate",
-            "params": {
-                "expression": "document.documentElement.outerHTML",
-                "returnByValue": True,
-            },
-        }))
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            message = json.loads(connection.recv())
-            if message.get("id") != 1:
-                continue                      # an event we did not ask for
-            result = message.get("result", {}).get("result", {})
-            return result.get("value") or ""
-        return ""
+        reply = _call(connection, 1, "Runtime.evaluate", {
+            "expression": "document.documentElement.outerHTML",
+            "returnByValue": True,
+        }, timeout)
+        result = reply.get("result", {})
+        html = result.get("result", {}).get("value") or ""
+        if result.get("exceptionDetails"):
+            log.debug(f"  evaluate raised: {result['exceptionDetails'].get('text')}")
+
+        if not html or is_unloaded(html):
+            document = _call(connection, 2, "DOM.getDocument",
+                             {"depth": 0}, timeout)
+            node_id = document.get("result", {}).get("root", {}).get("nodeId")
+            if node_id:
+                outer = _call(connection, 3, "DOM.getOuterHTML",
+                              {"nodeId": node_id}, timeout)
+                via_dom = outer.get("result", {}).get("outerHTML") or ""
+                if via_dom and not is_unloaded(via_dom):
+                    log.debug("  read via DOM.getOuterHTML")
+                    return via_dom
+        return html
     finally:
         try:
             connection.close()
@@ -166,8 +187,7 @@ def _report_idle(open_tabs: int) -> None:
     occasionally — at a five second poll, saying it every time would be twelve
     lines a minute of nothing new.
     """
-    global _last_status, _passes
-    _passes += 1
+    global _last_status
     now = time.time()
     if _passes > 3 and now - _last_status < STATUS_EVERY:
         return
@@ -206,6 +226,8 @@ def _activate(ws_url: str | None) -> None:
 
 def save_ready_tabs(endpoint: str, out_dir: pathlib.Path, saved: set[str]) -> int:
     """Write every results tab that has finished loading. Returns how many."""
+    global _passes
+    _passes += 1
     names = league_names()
     written = 0
     ws_by_season = {
@@ -218,6 +240,10 @@ def save_ready_tabs(endpoint: str, out_dir: pathlib.Path, saved: set[str]) -> in
         if season_id in saved:
             continue
         label = names.get(season_id, f"season {season_id}")
+
+        if _passes <= 2:
+            preview = " ".join(html[:110].split())
+            log.info(f"  {label}: {len(html)} bytes, starts: {preview!r}")
 
         if is_unloaded(html):
             log.info(f"  {label}: tab not loaded yet — bringing it to the front")
