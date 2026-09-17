@@ -77,7 +77,14 @@ for root in "${PLAYWRIGHT_BROWSERS_PATH:-}" "$HOME/.cache/ms-playwright" \
 done
 [ -n "$CHROME" ] || { echo "No chromium in this image." >&2; exit 1; }
 
-cleanup() { kill $(jobs -p) 2>/dev/null || true; }
+X11VNC_LOG_DIR="$(mktemp -d)"
+chmod 700 "$X11VNC_LOG_DIR"
+X11VNC_LOG="$X11VNC_LOG_DIR/x11vnc.log"
+
+cleanup() {
+    kill $(jobs -p) 2>/dev/null || true
+    rm -rf -- "$X11VNC_LOG_DIR"
+}
 trap cleanup EXIT
 # As PID 1 in a container, a shell gets no default signal disposition: SIGINT is
 # ignored unless something is explicitly listening, so Ctrl-C does nothing at
@@ -107,16 +114,16 @@ fi
 [ -s /tmp/.vncpass ] || { echo "Password file is empty — refusing to start." >&2; exit 1; }
 
 # -xkb keeps keyboard mapping sane over VNC. If input does not work at all,
-# /tmp/x11vnc.log is where x11vnc says why (a missing XTEST extension being the
+# $X11VNC_LOG is where x11vnc says why (a missing XTEST extension being the
 # usual reason a session looks connected but ignores clicks).
 x11vnc -display :99 -rfbport "$PORT" -rfbauth /tmp/.vncpass \
-    -forever -shared -noxdamage -xkb >/tmp/x11vnc.log 2>&1 &
+    -forever -shared -noxdamage -xkb >"$X11VNC_LOG" 2>&1 &
 X11VNC_PID=$!
 
 sleep 2
 if ! kill -0 "$X11VNC_PID" 2>/dev/null; then
     echo "x11vnc exited immediately:" >&2
-    tail -20 /tmp/x11vnc.log >&2
+    tail -20 "$X11VNC_LOG" >&2
     exit 1
 fi
 
@@ -243,10 +250,10 @@ cat <<EOF
 
 EOF
 
-if grep -qi "xtest" /tmp/x11vnc.log 2>/dev/null; then
+if grep -Fqi "XTEST extension not available" "$X11VNC_LOG" 2>/dev/null; then
     echo "  NOTE: x11vnc reported something about XTEST — clicks and typing may" >&2
     echo "        not reach the browser. Tabs are brought to the front for you," >&2
-    echo "        so saving still works; see /tmp/x11vnc.log." >&2
+    echo "        so saving still works; see $X11VNC_LOG." >&2
     echo >&2
 fi
 

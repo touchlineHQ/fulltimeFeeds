@@ -10,6 +10,7 @@ Skipped when there is no Chromium or no display to run it on.
 
 import http.server
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -110,6 +111,7 @@ def site():
 def live_browser(site):
     """A real browser with one tab per league, and its debugging endpoint."""
     base, _ = site
+    previous_display = os.environ.get("DISPLAY")
     try:
         executable = browser_mod.find_chromium()
         xvfb = browser_mod.ensure_display()
@@ -159,6 +161,10 @@ def live_browser(site):
             proc.kill()
         if xvfb:
             xvfb.terminate()
+        if previous_display is None:
+            os.environ.pop("DISPLAY", None)
+        else:
+            os.environ["DISPLAY"] = previous_display
 
 
 class TestAgainstARealBrowser:
