@@ -106,8 +106,11 @@ if ! x11vnc -storepasswd "$VNC_SECRET" /tmp/.vncpass >/tmp/storepasswd.log 2>&1;
 fi
 [ -s /tmp/.vncpass ] || { echo "Password file is empty — refusing to start." >&2; exit 1; }
 
+# -xkb keeps keyboard mapping sane over VNC. If input does not work at all,
+# /tmp/x11vnc.log is where x11vnc says why (a missing XTEST extension being the
+# usual reason a session looks connected but ignores clicks).
 x11vnc -display :99 -rfbport "$PORT" -rfbauth /tmp/.vncpass \
-    -forever -shared -noxdamage >/tmp/x11vnc.log 2>&1 &
+    -forever -shared -noxdamage -xkb >/tmp/x11vnc.log 2>&1 &
 X11VNC_PID=$!
 
 sleep 2
@@ -239,5 +242,12 @@ cat <<EOF
   Ctrl-C here when you are done.
 
 EOF
+
+if grep -qi "xtest" /tmp/x11vnc.log 2>/dev/null; then
+    echo "  NOTE: x11vnc reported something about XTEST — clicks and typing may" >&2
+    echo "        not reach the browser. Tabs are brought to the front for you," >&2
+    echo "        so saving still works; see /tmp/x11vnc.log." >&2
+    echo >&2
+fi
 
 wait

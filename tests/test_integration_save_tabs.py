@@ -209,6 +209,25 @@ class TestAgainstARealBrowser:
         assert blocked_season in saved
         assert (tmp_path / f"{blocked_season}.html").is_file()
 
+    def test_a_tab_can_be_brought_to_the_front(self, module, live_browser):
+        # What makes the session usable when the VNC view cannot be clicked:
+        # Chrome loads a background tab when it is shown, and this asks for the
+        # tab the script itself opened to be shown.
+        targets = json.loads(
+            urllib.request.urlopen(f"{live_browser}/json/list", timeout=5).read()
+        )
+        pages = [t for t in targets if t.get("type") == "page"]
+        assert pages
+
+        before = pages[-1]["webSocketDebuggerUrl"]
+        module["_activate"](before)             # must not raise
+
+        # And the browser is still answering afterwards.
+        after = json.loads(
+            urllib.request.urlopen(f"{live_browser}/json/list", timeout=5).read()
+        )
+        assert len([t for t in after if t.get("type") == "page"]) == len(pages)
+
     def test_saved_pages_feed_the_scraper(self, module, live_browser, tmp_path, monkeypatch):
         saved: set[str] = set()
         for _ in range(10):

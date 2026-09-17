@@ -294,11 +294,13 @@ class TestUnloadedTabs:
             ],
         )
 
+        monkeypatch.setitem(module, "_safe_targets", lambda endpoint: [])
+
         with caplog.at_level("INFO", logger="save_open_tabs"):
             written = module["save_ready_tabs"]("http://x", tmp_path, set())
 
         assert written == 0
-        assert "click it in the browser" in caplog.text
+        assert "bringing it to the front" in caplog.text
 
     def test_a_loaded_page_without_results_says_something_different(
         self, module, tmp_path, monkeypatch, caplog
@@ -313,3 +315,41 @@ class TestUnloadedTabs:
 
         assert "may not have played" in caplog.text
         assert "click it in the browser" not in caplog.text
+
+
+class TestRowsBeatChallengeMarkers:
+    """Cloudflare's scripts appear on ordinary pages, so rows decide."""
+
+    def test_a_results_page_carrying_cloudflare_script_is_still_saved(
+        self, module, tmp_path, monkeypatch
+    ):
+        # Checking for a challenge first threw away pages that had loaded fine.
+        page = _page("918978398").replace(
+            "<body>",
+            '<body><script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>',
+        )
+        monkeypatch.setitem(module, "_safe_targets", lambda endpoint: [])
+        monkeypatch.setitem(
+            module, "open_results_tabs",
+            lambda endpoint: [("918978398", _url("918978398"), page)],
+        )
+
+        assert module["save_ready_tabs"]("http://x", tmp_path, set()) == 1
+        assert (tmp_path / "918978398.html").is_file()
+
+    def test_a_real_challenge_without_rows_is_still_held_back(
+        self, module, tmp_path, monkeypatch, caplog
+    ):
+        page = ("<html><head>" + ("<!-- pad -->" * 500)
+                + '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/jsch/v1">'
+                "</script></head><body>verifying</body></html>")
+        monkeypatch.setitem(module, "_safe_targets", lambda endpoint: [])
+        monkeypatch.setitem(
+            module, "open_results_tabs",
+            lambda endpoint: [("918978398", _url("918978398"), page)],
+        )
+
+        with caplog.at_level("INFO", logger="save_open_tabs"):
+            assert module["save_ready_tabs"]("http://x", tmp_path, set()) == 0
+
+        assert "still showing a challenge" in caplog.text

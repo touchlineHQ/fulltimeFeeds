@@ -64,6 +64,14 @@ TAB_TIMEOUT_MS = 5_000
 TAB_TIMEOUT = 5.0
 
 
+def _safe_targets(endpoint: str) -> list[dict]:
+    """Targets, or an empty list — used where a failure must not stop a pass."""
+    try:
+        return _targets(endpoint)
+    except Exception:
+        return []
+
+
 def _targets(endpoint: str) -> list[dict]:
     """Every tab the browser has open, from the debug port's HTTP listing."""
     import urllib.request
@@ -171,10 +179,40 @@ def _report_idle(open_tabs: int) -> None:
         log.info("  waiting — no tabs open in the browser yet")
 
 
+def _activate(ws_url: str | None) -> None:
+    """Bring a tab to the front, so Chrome loads it.
+
+    Chrome does not load a tab opened in the background until it is visited,
+    and a VNC session on a phone is an awkward place to visit seven of them.
+    This asks for the tab the script itself opened to be shown; it chooses no
+    address and fetches nothing that was not already asked for.
+    """
+    if not ws_url:
+        return
+    try:
+        import websocket
+
+        connection = websocket.create_connection(
+            ws_url, timeout=TAB_TIMEOUT, suppress_origin=True
+        )
+        try:
+            connection.send(json.dumps({"id": 1, "method": "Page.bringToFront"}))
+            connection.recv()
+        finally:
+            connection.close()
+    except Exception as e:
+        log.debug(f"  could not bring a tab to the front: {e}")
+
+
 def save_ready_tabs(endpoint: str, out_dir: pathlib.Path, saved: set[str]) -> int:
     """Write every results tab that has finished loading. Returns how many."""
     names = league_names()
     written = 0
+    ws_by_season = {
+        SEASON_RE.search(t.get("url", "")).group(1): t.get("webSocketDebuggerUrl")
+        for t in _safe_targets(endpoint)
+        if SEASON_RE.search(t.get("url", "")) and "/results/" in t.get("url", "")
+    }
 
     for season_id, url, html in open_results_tabs(endpoint):
         if season_id in saved:
@@ -182,15 +220,19 @@ def save_ready_tabs(endpoint: str, out_dir: pathlib.Path, saved: set[str]) -> in
         label = names.get(season_id, f"season {season_id}")
 
         if is_unloaded(html):
-            log.info(f"  {label}: tab not loaded yet — click it in the browser "
-                     f"(Chrome loads a background tab only when you visit it)")
+            log.info(f"  {label}: tab not loaded yet — bringing it to the front")
+            _activate(ws_by_season.get(season_id))
             continue
-        if is_challenge_page(html):
-            log.info(f"  {label}: still showing a challenge — solve it in the browser")
-            continue
+        # Rows first, deliberately. A page holding a results table is a results
+        # page whatever else is on it, and Cloudflare's scripts appear on
+        # ordinary pages too — checking for a challenge first threw away pages
+        # that had loaded perfectly well.
         if ROW_MARKER not in html:
-            log.info(f"  {label}: loaded, but holds no results table "
-                     f"(this league may not have played yet)")
+            if is_challenge_page(html):
+                log.info(f"  {label}: still showing a challenge — solve it in the browser")
+            else:
+                log.info(f"  {label}: loaded, but holds no results table "
+                         f"(this league may not have played yet)")
             continue
 
         destination = out_dir / f"{season_id}.html"

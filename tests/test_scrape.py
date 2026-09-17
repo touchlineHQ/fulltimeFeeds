@@ -1364,7 +1364,10 @@ class TestFetchResultsFromSavedPage:
         monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: ROWS)
         monkeypatch.setattr(
             scrape, "parse_results",
-            lambda html: [scrape.Result("12/09/26", "15:00", "A", "B", 1, 0, "G", "D")],
+            lambda html: (
+                [scrape.Result("12/09/26", "15:00", "A", "B", 1, 0, "G", "D")]
+                if "home-team" in html else []
+            ),
         )
 
         results = scrape.fetch_results("918978398", "Euro Soccer", browser=None)
@@ -1377,9 +1380,14 @@ class TestFetchResultsFromSavedPage:
         _saved_page(tmp_path, "918978398", rows=9)
         monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
         browser = _FakeBrowser(html=ROWS)
+        # Must depend on the page: rows now decide whether a response is usable,
+        # so a stub that parses anything would make the block page look fine.
         monkeypatch.setattr(
             scrape, "parse_results",
-            lambda html: [scrape.Result("12/09/26", "15:00", "A", "B", 1, 0, "G", "D")],
+            lambda html: (
+                [scrape.Result("12/09/26", "15:00", "A", "B", 1, 0, "G", "D")]
+                if "home-team" in html else []
+            ),
         )
 
         results = scrape.fetch_results("918978398", "Euro Soccer", browser=browser)
@@ -1393,3 +1401,44 @@ class TestFetchResultsFromSavedPage:
 
         with pytest.raises(scrape.ResultsUnavailable, match="no saved page was found"):
             scrape.fetch_results("918978398", "Euro Soccer", browser=None)
+
+
+class TestRowsDecideOverChallengeMarkers:
+    """A page that parsed is a results page, whatever scripts it carries."""
+
+    CLOUDFLARE_SCRIPT = (
+        '<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>'
+    )
+
+    def test_a_results_page_with_cloudflare_script_is_used(self, monkeypatch):
+        page = f"<html><body>{self.CLOUDFLARE_SCRIPT}<td class='home-team'>A</td></body></html>"
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: page)
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: [scrape.Result("12/09/26", "15:00", "A", "B", 1, 0, "G", "D")],
+        )
+
+        results = scrape.fetch_results("123", "League A", browser=None)
+
+        assert len(results) == 1
+        assert scrape.LAST_SOURCE == "a plain fetch"
+
+    def test_an_interstitial_with_no_rows_is_still_a_refusal(self, monkeypatch, tmp_path):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        monkeypatch.setattr(
+            scrape, "_fetch_page",
+            lambda url, label: "<html><title>Just a moment...</title></html>",
+        )
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [])
+
+        with pytest.raises(scrape.ResultsUnavailable):
+            scrape.fetch_results("123", "League A", browser=None)
+
+    def test_an_empty_but_genuine_page_is_not_a_refusal(self, monkeypatch):
+        monkeypatch.setattr(
+            scrape, "_fetch_page",
+            lambda url, label: "<html><body>No results found</body></html>",
+        )
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [])
+
+        assert scrape.fetch_results("123", "League A", browser=None) == []

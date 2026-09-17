@@ -370,12 +370,17 @@ def fetch_results(
         refusal = str(e)
         html = ""
 
-    if html and not is_challenge_page(html):
+    if html:
         log.debug(f"Results HTML length: {len(html)}, tables: {html.count('<table')}")
-        # A page that answers with no rows is a league that has not played yet,
-        # which is not the same as one we were refused.
-        LAST_SOURCE = "a plain fetch"
-        return parse_results(html)
+        results = parse_results(html)
+        # Rows decide, not the markers: Cloudflare's scripts appear on ordinary
+        # pages too, and treating a page that parsed as an interstitial would
+        # throw away results we had already been given.
+        if results or not is_challenge_page(html):
+            # A page that answers with no rows is a league that has not played
+            # yet, which is not the same as one we were refused.
+            LAST_SOURCE = "a plain fetch"
+            return results
 
     if browser is not None:
         log.info(f"  {label}: refused a plain fetch — retrying through the browser")
@@ -388,11 +393,12 @@ def fetch_results(
             log.warning(f"  {label}: browser fetch failed ({e})")
             rendered = ""
 
-        if rendered and not is_challenge_page(rendered):
+        if rendered:
             results = parse_results(rendered)
-            log.info(f"  {label}: {len(results)} result(s) via the browser")
-            LAST_SOURCE = "the browser"
-            return results
+            if results or not is_challenge_page(rendered):
+                log.info(f"  {label}: {len(results)} result(s) via the browser")
+                LAST_SOURCE = "the browser"
+                return results
 
     # Last resort, and the one that does not depend on winning an argument with
     # a WAF: a page someone loaded in a browser and saved.

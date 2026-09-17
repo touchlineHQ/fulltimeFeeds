@@ -29,11 +29,16 @@ BLOCK_MARKERS = ("attention required",)
 # "just a moment" is the visible title, but it is not always near the top of a
 # challenge page; the challenge-platform script tag and the __cf_chl token are
 # on every one of them and are what make this reliable.
+# Careful with these. Cloudflare injects a challenge-platform script into
+# ordinary pages as well, so the bare path is not evidence of anything; only
+# the orchestration path and the challenge token are. Callers should treat a
+# page holding real content as real content regardless, which is the safer way
+# round: a false positive here hides results that were successfully fetched.
 CHALLENGE_MARKERS = (
     "just a moment",
     "checking your browser",
     "cf-challenge",
-    "cdn-cgi/challenge-platform",
+    "challenge-platform/h/",
     "__cf_chl",
 )
 # How much of a page to look at. A challenge page can carry a lot of inline
