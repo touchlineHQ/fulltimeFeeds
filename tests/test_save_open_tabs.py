@@ -177,3 +177,88 @@ class TestIdleReporting:
                 module["_report_idle"](7)
 
         assert caplog.text.count("tab(s) open") == 3
+
+
+class TestDirectCdp:
+    """Reading one tab at a time, so an unresponsive tab costs only itself."""
+
+    @staticmethod
+    def _install_websocket(monkeypatch, replies):
+        """Stub websocket-client. `replies` maps ws url -> list of messages."""
+        import json as json_mod
+
+        class _Connection:
+            def __init__(self, url):
+                self.url = url
+                self._queue = list(replies.get(url, []))
+
+            def send(self, payload):
+                assert "Runtime.evaluate" in payload
+
+            def recv(self):
+                if not self._queue:
+                    raise TimeoutError("timed out")
+                item = self._queue.pop(0)
+                return item if isinstance(item, str) else json_mod.dumps(item)
+
+            def close(self):
+                pass
+
+        module = type(sys)("websocket")
+        module.create_connection = lambda url, timeout=None, suppress_origin=None: (
+            _Connection(url)
+        )
+        monkeypatch.setitem(sys.modules, "websocket", module)
+
+    def test_html_is_read_from_the_evaluate_reply(self, module, monkeypatch):
+        self._install_websocket(monkeypatch, {
+            "ws://tab-1": [{"id": 1, "result": {"result": {"value": "<html>hi</html>"}}}],
+        })
+
+        assert module["_page_html"]("ws://tab-1") == "<html>hi</html>"
+
+    def test_events_arriving_first_are_stepped_over(self, monkeypatch, module):
+        # A busy tab emits console and network events; the reply we want is the
+        # one carrying our id.
+        self._install_websocket(monkeypatch, {
+            "ws://tab-1": [
+                {"method": "Network.requestWillBeSent", "params": {}},
+                {"method": "Runtime.consoleAPICalled", "params": {}},
+                {"id": 1, "result": {"result": {"value": "<html>ok</html>"}}},
+            ],
+        })
+
+        assert module["_page_html"]("ws://tab-1") == "<html>ok</html>"
+
+    def test_a_silent_tab_raises_rather_than_hanging_the_pass(self, monkeypatch, module):
+        self._install_websocket(monkeypatch, {"ws://tab-1": []})
+
+        with pytest.raises(Exception):
+            module["_page_html"]("ws://tab-1")
+
+    def test_one_dead_tab_does_not_stop_the_others(self, module, monkeypatch):
+        targets = [
+            {"type": "page", "url": _url("918978398"), "webSocketDebuggerUrl": "ws://ok"},
+            {"type": "page", "url": _url("71450136"), "webSocketDebuggerUrl": "ws://dead"},
+        ]
+        monkeypatch.setitem(module, "_targets", lambda endpoint: targets)
+
+        def read(ws_url, timeout=None):
+            if ws_url == "ws://dead":
+                raise TimeoutError("timed out")
+            return _page("918978398")
+
+        monkeypatch.setitem(module, "_page_html", read)
+
+        found = module["open_results_tabs"]("http://localhost:9222")
+
+        assert [season for season, _, _ in found] == ["918978398"]
+
+    def test_non_results_tabs_are_ignored(self, module, monkeypatch):
+        monkeypatch.setitem(module, "_targets", lambda endpoint: [
+            {"type": "page", "url": "https://api.ipify.org", "webSocketDebuggerUrl": "ws://a"},
+            {"type": "page", "url": "about:blank", "webSocketDebuggerUrl": "ws://b"},
+        ])
+        monkeypatch.setitem(module, "_page_html", lambda ws, timeout=None: "<html></html>")
+
+        assert module["open_results_tabs"]("http://localhost:9222") == []

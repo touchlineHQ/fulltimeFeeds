@@ -30,7 +30,8 @@ WORKDIR /app
 
 # Install Python packages (curl_cffi pinned: its browser impersonation must
 # track a recent Chrome to keep Full-Time's WAF happy)
-RUN pip install --no-cache-dir curl_cffi==0.16.1 beautifulsoup4 playwright lxml boto3
+RUN pip install --no-cache-dir curl_cffi==0.16.1 beautifulsoup4 playwright lxml boto3 \
+    websocket-client
 
 # Optional, and off unless RESULTS_SESSION names it: nodriver drives Chrome
 # without the attached-CDP pattern that Full-Time's challenge detects. Installed

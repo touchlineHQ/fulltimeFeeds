@@ -15,6 +15,7 @@ Run it in the terminal inside the VNC session, or let vnc_browser.sh start it:
 """
 
 import argparse
+import json
 import logging
 import pathlib
 import re
@@ -41,47 +42,57 @@ _passes = 0
 # A tab that cannot be read in a few seconds is not ready anyway.
 TAB_TIMEOUT_MS = 5_000
 
-# One connection, reused: starting a driver and attaching for every poll costs
-# seconds a time and is the slowest part of the loop by far.
-_connection = None
+# Playwright's connect_over_cdp adopts the whole browser: it attaches to every
+# target and waits for each to answer. A tab sitting on a challenge does not
+# answer, so one unresponsive tab stalls the connection to all of them — which
+# is what "ws connected, then Timeout 15000ms exceeded" was.
+#
+# Reading one page needs none of that. The debug port lists its tabs over plain
+# HTTP, and each tab has its own websocket, so a tab that will not answer costs
+# only its own timeout.
+TAB_TIMEOUT = 5.0
 
 
-def _connected(endpoint: str):
-    """The browser at *endpoint*, reconnecting if the connection has dropped."""
-    global _connection
-    if _connection is not None:
-        _, browser = _connection
-        try:
-            if browser.is_connected():
-                return browser
-        except Exception:
-            pass
-        _disconnect()
+def _targets(endpoint: str) -> list[dict]:
+    """Every tab the browser has open, from the debug port's HTTP listing."""
+    import urllib.request
 
-    log.info(f"  starting the playwright driver ...")
-    from playwright.sync_api import sync_playwright
+    with urllib.request.urlopen(f"{endpoint}/json/list", timeout=5) as response:
+        return [t for t in json.loads(response.read()) if t.get("type") == "page"]
 
-    pw = sync_playwright().start()
-    log.info(f"  driver up; attaching to the browser at {endpoint} ...")
+
+def _page_html(ws_url: str, timeout: float = TAB_TIMEOUT) -> str:
+    """Ask one tab for its rendered HTML, over its own websocket.
+
+    Nothing is navigated or reloaded: this reads the document already on
+    screen, which is what the person driving the browser fetched.
+    """
+    import websocket  # websocket-client
+
+    # Chrome rejects a debug websocket carrying a browser Origin header.
+    connection = websocket.create_connection(
+        ws_url, timeout=timeout, suppress_origin=True
+    )
     try:
-        browser = pw.chromium.connect_over_cdp(endpoint, timeout=15_000)
-    except Exception:
-        pw.stop()
-        raise
-    log.info(f"  attached ({len(browser.contexts)} context(s))")
-    _connection = (pw, browser)
-    return browser
-
-
-def _disconnect() -> None:
-    global _connection
-    if _connection is None:
-        return
-    pw, browser = _connection
-    _connection = None
-    for shut in (browser.close, pw.stop):
+        connection.send(json.dumps({
+            "id": 1,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": "document.documentElement.outerHTML",
+                "returnByValue": True,
+            },
+        }))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            message = json.loads(connection.recv())
+            if message.get("id") != 1:
+                continue                      # an event we did not ask for
+            result = message.get("result", {}).get("result", {})
+            return result.get("value") or ""
+        return ""
+    finally:
         try:
-            shut()
+            connection.close()
         except Exception:
             pass
 
@@ -97,28 +108,28 @@ def open_results_tabs(endpoint: str) -> list[tuple[str, str, str]]:
     to start or steer one.
     """
     found: list[tuple[str, str, str]] = []
-    browser = _connected(endpoint)
-    total = 0
+    targets = _targets(endpoint)
 
-    for context in browser.contexts:
-        for page in context.pages:
-            total += 1
-            url = page.url
-            if "/results/" not in url:
-                continue
-            season = SEASON_RE.search(url)
-            if not season:
-                continue
-            try:
-                page.set_default_timeout(TAB_TIMEOUT_MS)
-                html = page.content()
-            except Exception as e:              # still loading, or mid-navigation
-                log.debug(f"  could not read {url}: {e}")
-                continue
+    for target in targets:
+        url = target.get("url", "")
+        if "/results/" not in url:
+            continue
+        season = SEASON_RE.search(url)
+        if not season:
+            continue
+        ws_url = target.get("webSocketDebuggerUrl")
+        if not ws_url:
+            continue
+        try:
+            html = _page_html(ws_url)
+        except Exception as e:                  # still loading, or busy
+            log.debug(f"  could not read {url}: {e}")
+            continue
+        if html:
             found.append((season.group(1), url, html))
 
     if not found:
-        _report_idle(total)
+        _report_idle(len(targets))
     return found
 
 
@@ -211,8 +222,6 @@ def main() -> int:
             time.sleep(args.interval)
     except KeyboardInterrupt:
         log.info("\nStopped.")
-    finally:
-        _disconnect()
 
     log.info(f"\n{len(saved)} of {total_leagues} league(s) saved to {out_dir}")
     if saved:

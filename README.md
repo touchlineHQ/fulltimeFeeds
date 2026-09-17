@@ -366,6 +366,12 @@ them out — it never navigates, reloads or opens anything, because every page i
 saves was fetched by the person driving the browser. Reading a rendered page
 makes no request, which is why this works where driving the browser does not.
 
+It talks to the browser's debug port directly rather than through Playwright.
+`connect_over_cdp` adopts the whole browser, attaching to every target and
+waiting for each to answer, so a single tab sitting on a challenge stalls the
+connection to all of them. Listing tabs over HTTP and reading each through its
+own websocket means an unresponsive tab costs only its own five second timeout.
+
 Set `VNC_AUTOSAVE=0` to turn it off and save tabs by hand with `Ctrl+S` instead;
 filenames do not matter then, since each page names its own season in the links
 it renders.
