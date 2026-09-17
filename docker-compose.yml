@@ -8,12 +8,26 @@ services:
     # Automatically injects all variables found in your local .env file
     env_file:
       - .env
+    # Chromium keeps renderer shared memory in /dev/shm, and Docker's 64MB
+    # default is too small for a page this size — the tab dies rather than
+    # renders. Raising it beats --disable-dev-shm-usage, which trades the crash
+    # for slow, flaky rendering.
+    shm_size: 1gb
     # Persist published feeds/calendars across runs so a league that fails to
     # fetch one run keeps its previously published data (and stays in index.json).
     volumes:
       - scraper_feeds:/app/feeds
       - scraper_calendars:/app/calendars
+      # Whatever a hand-driven browser does — a sign-in, a prompt, a challenge —
+      # stays in this profile between runs. See scripts/vnc_browser.sh.
+      - scraper_state:/app/state
+    ports:
+      # Only published with `docker compose run --service-ports` or `up`, and
+      # only useful while scripts/vnc_browser.sh is running.
+      - "${VNC_WEB_PORT:-6080}:6080"   # noVNC in a web browser
+      - "${VNC_PORT:-5900}:5900"       # a native VNC client
 
 volumes:
   scraper_feeds:
   scraper_calendars:
+  scraper_state:

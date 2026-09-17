@@ -576,3 +576,869 @@ class TestMainExitCodes:
         by_slug = {e["slug"]: e for e in payload["leagues"]}
         assert by_slug["league-b"]["from_cache"] is True
         assert "from_cache" not in by_slug["league-a"]
+
+
+# ---------------------------------------------------------------------------
+# Consolidation — one row per match in a club feed
+# ---------------------------------------------------------------------------
+
+def _row(match_id, team, home_away, **extra):
+    """A club-feed row: one per (team, match), as the aggregator builds them."""
+    row = {
+        "id": match_id,
+        "date": "2026-10-11",
+        "time": "10:00",
+        "home_team": "East Leake Orange U12",
+        "away_team": "East Leake Red U12",
+        "venue": "Costock Road",
+        "division": "U12 Division 6",
+        "league": "YEL Sunday 26/27",
+        "team": team,
+        "home_away": home_away,
+        "opponent": "East Leake Red U12" if home_away == "home" else "East Leake Orange U12",
+    }
+    row.update(extra)
+    return row
+
+
+class TestConsolidateMatches:
+
+    def test_derby_collapses_to_the_home_side(self):
+        rows = [
+            _row("m1", "East Leake Orange U12", "home"),
+            _row("m1", "East Leake Red U12", "away"),
+        ]
+
+        out = scrape.consolidate_matches(rows)
+
+        assert len(out) == 1
+        assert out[0]["team"] == "East Leake Orange U12"
+        assert out[0]["home_away"] == "home"
+        assert out[0]["derby"] is True
+
+    def test_home_side_wins_even_when_the_away_row_came_first(self):
+        rows = [
+            _row("m1", "East Leake Red U12", "away"),
+            _row("m1", "East Leake Orange U12", "home"),
+        ]
+
+        out = scrape.consolidate_matches(rows)
+
+        assert [r["team"] for r in out] == ["East Leake Orange U12"]
+        assert out[0]["derby"] is True
+
+    def test_same_team_twice_is_deduplicated_without_a_derby_flag(self):
+        rows = [
+            _row("m1", "East Leake Orange U12", "home"),
+            _row("m1", "East Leake Orange U12", "home"),
+        ]
+
+        out = scrape.consolidate_matches(rows)
+
+        assert len(out) == 1
+        assert "derby" not in out[0]
+
+    def test_distinct_matches_are_left_alone_and_keep_their_order(self):
+        rows = [
+            _row("m1", "East Leake Orange U12", "home"),
+            _row("m2", "East Leake Red U12", "away"),
+        ]
+
+        out = scrape.consolidate_matches(rows)
+
+        assert [r["id"] for r in out] == ["m1", "m2"]
+        assert all("derby" not in r for r in out)
+
+    def test_source_rows_are_not_mutated(self):
+        rows = [
+            _row("m1", "East Leake Orange U12", "home"),
+            _row("m1", "East Leake Red U12", "away"),
+        ]
+
+        scrape.consolidate_matches(rows)
+
+        assert all("derby" not in row for row in rows)
+
+
+class TestDropSettledFixtures:
+
+    def test_fixture_with_a_result_is_dropped(self):
+        fixtures = [_row("m1", "East Leake Robins", "home"), _row("m2", "East Leake Robins", "away")]
+        results = [_row("m1", "East Leake Robins", "home", home_score=3, away_score=1)]
+
+        out = scrape.drop_settled_fixtures(fixtures, results)
+
+        assert [r["id"] for r in out] == ["m2"]
+
+    def test_no_results_leaves_the_fixture_list_intact(self):
+        fixtures = [_row("m1", "East Leake Robins", "home")]
+
+        assert scrape.drop_settled_fixtures(fixtures, []) == fixtures
+
+
+class TestDedupeTeamRows:
+
+    def test_same_match_and_team_across_two_competitions_is_kept_once(self):
+        rows = [
+            _row("m1", "East Leake Robins", "home", league="League A"),
+            _row("m1", "East Leake Robins", "home", league="League B"),
+        ]
+
+        out = scrape.dedupe_team_rows(rows)
+
+        assert len(out) == 1
+        assert out[0]["league"] == "League A"
+
+    def test_two_teams_in_the_same_match_both_survive(self):
+        rows = [
+            _row("m1", "East Leake Orange U12", "home"),
+            _row("m1", "East Leake Red U12", "away"),
+        ]
+
+        assert len(scrape.dedupe_team_rows(rows)) == 2
+
+
+class TestWriteClubFeed:
+    """End-to-end shape of feeds/clubs/<slug>.json."""
+
+    @staticmethod
+    def _write(tmp_path, monkeypatch, fixtures, results, generated="2026-09-16T12:00:00Z"):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        scrape.write_club_feed("East Leake", "east-leake", fixtures, results, generated)
+        return json.loads(
+            (tmp_path / "feeds" / "clubs" / "east-leake.json").read_text(encoding="utf-8")
+        )
+
+    def test_open_age_derby_is_listed_once(self, tmp_path, monkeypatch):
+        fixtures = [
+            _row("m1", "East Leake Robins", "home",
+                 home_team="East Leake Robins", away_team="East Leake Robins Reserves",
+                 opponent="East Leake Robins Reserves", division="Division One"),
+            _row("m1", "East Leake Robins Reserves", "away",
+                 home_team="East Leake Robins", away_team="East Leake Robins Reserves",
+                 opponent="East Leake Robins", division="Division One"),
+        ]
+
+        payload = self._write(tmp_path, monkeypatch, fixtures, [])
+
+        assert len(payload["fixtures"]) == 1
+        assert payload["fixtures"][0]["derby"] is True
+        assert payload["fixtures"][0]["team"] == "East Leake Robins"
+
+    def test_played_match_appears_only_in_results(self, tmp_path, monkeypatch):
+        played = _row(
+            "m1", "East Leake Robins", "home",
+            date="2026-09-12", home_team="East Leake Robins", away_team="Awsworth Villa",
+            opponent="Awsworth Villa", division="Division One",
+        )
+        result = dict(played, home_score=3, away_score=1, goals_for=3, goals_against=1)
+
+        payload = self._write(tmp_path, monkeypatch, [played], [result])
+
+        assert payload["fixtures"] == []
+        assert [r["id"] for r in payload["results"]] == ["m1"]
+
+    def test_no_match_id_is_listed_in_two_arrays(self, tmp_path, monkeypatch):
+        fixtures = [
+            _row("m1", "East Leake Robins", "home", date="2026-09-12",
+                 home_team="East Leake Robins", away_team="Awsworth Villa",
+                 opponent="Awsworth Villa", division="Division One"),
+            _row("m2", "East Leake Robins", "away", date="2026-10-03",
+                 home_team="Cotgrave", away_team="East Leake Robins",
+                 opponent="Cotgrave", division="Division One"),
+        ]
+        results = [
+            dict(fixtures[0], home_score=3, away_score=1, goals_for=3, goals_against=1),
+        ]
+
+        payload = self._write(tmp_path, monkeypatch, fixtures, results)
+
+        fixture_ids = {r["id"] for r in payload["fixtures"]}
+        result_ids = {r["id"] for r in payload["results"]}
+        assert fixture_ids.isdisjoint(result_ids)
+        assert fixture_ids == {"m2"}
+
+    def test_restricted_derby_gives_both_teams_a_participation_record(self, tmp_path, monkeypatch):
+        # Played last Sunday, and never moved onto the results page — the
+        # league does not publish U12-and-below results.
+        fixtures = [
+            _row("m1", "East Leake Orange U10", "home", date="2026-09-13",
+                 home_team="East Leake Orange U10", away_team="East Leake Red U10",
+                 opponent="East Leake Red U10", division="U10 Division 1"),
+            _row("m1", "East Leake Red U10", "away", date="2026-09-13",
+                 home_team="East Leake Orange U10", away_team="East Leake Red U10",
+                 opponent="East Leake Orange U10", division="U10 Division 1"),
+        ]
+
+        payload = self._write(tmp_path, monkeypatch, fixtures, [])
+
+        assert payload["fixtures"] == []
+        assert {r["team"] for r in payload["participation"]} == {
+            "East Leake Orange U10", "East Leake Red U10",
+        }
+        assert all(r["played"] is True for r in payload["participation"])
+        assert len({r["id"] for r in payload["participation"]}) == 2
+
+    def test_restricted_upcoming_derby_is_listed_once_and_redacted(self, tmp_path, monkeypatch):
+        fixtures = [
+            _row("m1", "East Leake Orange U10", "home", date="2026-11-08",
+                 home_team="East Leake Orange U10", away_team="East Leake Red U10",
+                 opponent="East Leake Red U10", division="U10 Division 1"),
+            _row("m1", "East Leake Red U10", "away", date="2026-11-08",
+                 home_team="East Leake Orange U10", away_team="East Leake Red U10",
+                 opponent="East Leake Orange U10", division="U10 Division 1"),
+        ]
+
+        payload = self._write(tmp_path, monkeypatch, fixtures, [])
+
+        assert len(payload["fixtures"]) == 1
+        row = payload["fixtures"][0]
+        assert row["team"] == "East Leake Orange U10"
+        assert row["opponent"] == "Opposition"
+        assert row["away_team"] == "Opposition"
+        assert row["venue"] == ""
+        assert row["publication_restricted"] is True
+
+    def test_restricted_result_becomes_one_participation_record_per_team(self, tmp_path, monkeypatch):
+        results = [
+            _row("m1", "East Leake Orange U10", "home", date="2026-09-13",
+                 division="U10 Division 1", goals_for=None, goals_against=None),
+            _row("m1", "East Leake Red U10", "away", date="2026-09-13",
+                 division="U10 Division 1", goals_for=None, goals_against=None),
+        ]
+
+        payload = self._write(tmp_path, monkeypatch, [], results)
+
+        assert payload["results"] == []
+        assert len(payload["participation"]) == 2
+        assert payload["compliance"]["results_withheld"] == 2
+        assert all("goals_for" not in r for r in payload["participation"])
+
+
+# ---------------------------------------------------------------------------
+# fetch_results — a refused page is reported, not published as "no results"
+# ---------------------------------------------------------------------------
+
+class TestFetchResults:
+
+    @staticmethod
+    def _result():
+        return scrape.Result(
+            date="12/09/26", time="15:00",
+            home_team="East Leake Robins", away_team="Awsworth Villa",
+            home_score=3, away_score=1,
+            venue="Costock Road", division_label="Division One",
+        )
+
+    def test_rows_are_returned_when_the_page_answers(self, monkeypatch):
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "<html>rows</html>")
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [self._result()])
+
+        assert len(scrape.fetch_results("123", "League A")) == 1
+
+    def test_refused_fetch_raises_results_unavailable(self, monkeypatch):
+        def blocked(url, label):
+            raise RuntimeError("HTTP Error 403")
+
+        monkeypatch.setattr(scrape, "_fetch_page", blocked)
+
+        with pytest.raises(scrape.ResultsUnavailable, match="League A"):
+            scrape.fetch_results("123", "League A")
+
+    def test_challenge_page_served_as_200_raises_too(self, monkeypatch):
+        # Cloudflare answers the results path with an interstitial; a 200
+        # carrying one is not data, and must not read as "no matches played".
+        challenge = "<html><head><title>Attention Required!</title></head></html>"
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: challenge)
+
+        with pytest.raises(scrape.ResultsUnavailable):
+            scrape.fetch_results("123", "League A")
+
+    def test_a_genuinely_empty_league_is_not_an_error(self, monkeypatch):
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "<html>no rows yet</html>")
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [])
+
+        assert scrape.fetch_results("123", "League A") == []
+
+    def test_no_browser_render_is_attempted(self, monkeypatch):
+        # Headless Chromium receives the same challenge page, so rendering only
+        # costs a browser launch per league per run.
+        rendered = []
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "<html>rows</html>")
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [self._result()])
+        monkeypatch.setattr(
+            scrape, "_fetch_page_js", lambda url, label: rendered.append(url) or "",
+        )
+
+        scrape.fetch_results("123", "League A")
+
+        assert rendered == []
+
+
+# ---------------------------------------------------------------------------
+# results_unavailable — an empty results array that says why
+# ---------------------------------------------------------------------------
+
+class TestResultsUnavailableFlag:
+
+    def test_club_feed_flags_a_league_that_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        scrape.write_club_feed(
+            "East Leake", "east-leake",
+            [_row("m1", "East Leake Robins", "home")], [],
+            "2026-09-16T12:00:00Z", results_unavailable=True,
+        )
+
+        payload = json.loads(
+            (tmp_path / "feeds" / "clubs" / "east-leake.json").read_text(encoding="utf-8")
+        )
+        assert payload["results_unavailable"] is True
+        assert payload["results"] == []
+
+    def test_absent_when_results_were_reachable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        scrape.write_club_feed(
+            "East Leake", "east-leake",
+            [_row("m1", "East Leake Robins", "home")], [],
+            "2026-09-16T12:00:00Z",
+        )
+
+        payload = json.loads(
+            (tmp_path / "feeds" / "clubs" / "east-leake.json").read_text(encoding="utf-8")
+        )
+        assert "results_unavailable" not in payload
+
+    def test_main_flags_every_feed_when_the_results_page_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        monkeypatch.setattr(scrape, "OUTPUT_DIR", tmp_path / "calendars")
+        monkeypatch.setattr(scrape, "LEAGUES", [("111", "League A")])
+        monkeypatch.setattr(
+            scrape, "fetch_fixtures",
+            lambda season, league: [
+                Fixture("11/10/26", "15:00", "East Leake Robins",
+                        "East Leake Robins Reserves", "Costock Road", "Division One"),
+            ],
+        )
+
+        def refused(season, league, browser=None):
+            raise scrape.ResultsUnavailable(f"{league}: results page refused")
+
+        monkeypatch.setattr(scrape, "fetch_results", refused)
+
+        assert scrape.main() == 0
+
+        club = json.loads(
+            (tmp_path / "feeds" / "clubs" / "east-leake.json").read_text(encoding="utf-8")
+        )
+        league = json.loads(
+            (tmp_path / "feeds" / "league-a" / "results.json").read_text(encoding="utf-8")
+        )
+        team = json.loads(
+            (tmp_path / "feeds" / "league-a" / "teams" / "east-leake-robins.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert club["results_unavailable"] is True
+        assert league["results_unavailable"] is True
+        assert team["results_unavailable"] is True
+
+
+# ---------------------------------------------------------------------------
+# Borrowing the operator's own browser session
+# ---------------------------------------------------------------------------
+
+class TestSessionCookies:
+
+    def test_parses_a_cookie_header_as_a_browser_sends_it(self, monkeypatch):
+        monkeypatch.setenv(
+            scrape.COOKIE_ENV, "cf_clearance=abc123; JSESSIONID=xyz; spaced = value "
+        )
+
+        assert scrape._session_cookies() == {
+            "cf_clearance": "abc123", "JSESSIONID": "xyz", "spaced": "value",
+        }
+
+    def test_unset_means_no_cookies(self, monkeypatch):
+        monkeypatch.delenv(scrape.COOKIE_ENV, raising=False)
+
+        assert scrape._session_cookies() == {}
+
+    def test_blank_and_malformed_parts_are_skipped(self, monkeypatch):
+        monkeypatch.setenv(scrape.COOKIE_ENV, "; novalue; =orphan; good=yes;")
+
+        assert scrape._session_cookies() == {"good": "yes"}
+
+
+# ---------------------------------------------------------------------------
+# fetch_results — falling back to a browser session
+# ---------------------------------------------------------------------------
+
+class _FakeBrowser:
+    """Stands in for BrowserSession, recording whether it was ever used."""
+
+    def __init__(self, html="", raises=None):
+        self.html = html
+        self.raises = raises
+        self.calls = []
+
+    def fetch(self, url, wait_selector=None):
+        self.calls.append(url)
+        if self.raises:
+            raise self.raises
+        return self.html
+
+
+CHALLENGE = "<html><head><title>Just a moment...</title></head></html>"
+BLOCK = "<html><head><title>Attention Required!</title></head></html>"
+ROWS = "<html><td class='home-team'>A</td></html>"
+
+
+class TestFetchResultsViaBrowser:
+
+    @staticmethod
+    def _result():
+        return scrape.Result(
+            date="12/09/26", time="15:00", home_team="East Leake Robins",
+            away_team="Awsworth Villa", home_score=3, away_score=1,
+            venue="Costock Road", division_label="Division One",
+        )
+
+    def test_plain_fetch_working_leaves_the_browser_untouched(self, monkeypatch):
+        # The expensive path must stay unused when the cheap one answers —
+        # that is what makes the session lazy rather than a launch per league.
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: ROWS)
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [self._result()])
+        browser = _FakeBrowser(html=ROWS)
+
+        assert len(scrape.fetch_results("123", "League A", browser=browser)) == 1
+        assert browser.calls == []
+
+    def test_empty_league_is_not_a_refusal(self, monkeypatch):
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: "<html>no rows</html>")
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [])
+        browser = _FakeBrowser()
+
+        assert scrape.fetch_results("123", "League A", browser=browser) == []
+        assert browser.calls == []
+
+    def test_challenge_page_falls_back_to_the_browser(self, monkeypatch):
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: CHALLENGE)
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: [self._result()] if "home-team" in html else [],
+        )
+        browser = _FakeBrowser(html=ROWS)
+
+        results = scrape.fetch_results("123", "League A", browser=browser)
+
+        assert len(results) == 1
+        assert len(browser.calls) == 1
+        assert "selectedSeason=123" in browser.calls[0]
+
+    def test_refused_fetch_falls_back_to_the_browser(self, monkeypatch):
+        def blocked(url, label):
+            raise RuntimeError("HTTP Error 403")
+
+        monkeypatch.setattr(scrape, "_fetch_page", blocked)
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: [self._result()] if "home-team" in html else [],
+        )
+        browser = _FakeBrowser(html=ROWS)
+
+        assert len(scrape.fetch_results("123", "League A", browser=browser)) == 1
+        assert len(browser.calls) == 1
+
+    def test_browser_challenged_too_raises_results_unavailable(self, monkeypatch):
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
+        browser = _FakeBrowser(html=CHALLENGE)
+
+        with pytest.raises(scrape.ResultsUnavailable, match="no saved page was found"):
+            scrape.fetch_results("123", "League A", browser=browser)
+
+    def test_no_browser_available_raises_results_unavailable(self, monkeypatch):
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
+
+        with pytest.raises(scrape.ResultsUnavailable, match="no saved page was found"):
+            scrape.fetch_results("123", "League A", browser=None)
+
+    def test_unstartable_browser_raises_results_unavailable(self, monkeypatch):
+        from browser import BrowserUnavailable
+
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
+        browser = _FakeBrowser(raises=BrowserUnavailable("no Xvfb"))
+
+        with pytest.raises(scrape.ResultsUnavailable, match="no saved page was found"):
+            scrape.fetch_results("123", "League A", browser=browser)
+
+
+class TestResultsBrowserSwitch:
+
+    def test_enabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("RESULTS_BROWSER", raising=False)
+
+        assert scrape._results_browser() is not None
+
+    @pytest.mark.parametrize("value", ["0", "false", "no"])
+    def test_can_be_turned_off(self, monkeypatch, value):
+        monkeypatch.setenv("RESULTS_BROWSER", value)
+
+        assert scrape._results_browser() is None
+
+    def test_main_closes_the_session_even_when_the_run_fails(self, monkeypatch):
+        closed = []
+
+        class _Session:
+            def close(self):
+                closed.append(True)
+
+        monkeypatch.setattr(scrape, "_results_browser", lambda: _Session())
+
+        def explode(holder):
+            holder.append(scrape._results_browser())
+            raise RuntimeError("scrape blew up")
+
+        monkeypatch.setattr(scrape, "_run", explode)
+
+        with pytest.raises(RuntimeError, match="scrape blew up"):
+            scrape.main()
+        assert closed == [True]
+
+
+# ---------------------------------------------------------------------------
+# _fetch_page — a refusal is not retried like a transient failure
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, status_code, text="body"):
+        self.status_code = status_code
+        self.text = text
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP Error {self.status_code}: ")
+
+
+class _FakeSession:
+    """Mimics curl_cffi's Session for the retry loop only."""
+
+    def __init__(self, responses, attempts):
+        self._responses = responses
+        self._attempts = attempts
+        self.headers = {}
+        self.cookies = type("Jar", (), {"set": lambda *a, **k: None})()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, timeout=None):
+        self._attempts.append(url)
+        index = min(len(self._attempts) - 1, len(self._responses) - 1)
+        return self._responses[index]
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    monkeypatch.setattr(scrape.time, "sleep", lambda s: None)
+
+
+class TestFetchPageRetries:
+
+    @staticmethod
+    def _install(monkeypatch, responses, attempts):
+        monkeypatch.setattr(
+            scrape.curl_requests, "Session",
+            lambda **kw: _FakeSession(responses, attempts),
+        )
+
+    def test_a_refusal_is_tried_twice_not_five_times(self, monkeypatch, no_sleep):
+        attempts = []
+        self._install(monkeypatch, [_FakeResponse(403)], attempts)
+
+        with pytest.raises(RuntimeError, match="403"):
+            scrape._fetch_page("https://example.test/results", "results")
+
+        assert len(attempts) == scrape.REFUSAL_RETRIES == 2
+
+    def test_a_transient_failure_still_gets_the_full_budget(self, monkeypatch, no_sleep):
+        attempts = []
+        self._install(monkeypatch, [_FakeResponse(503)], attempts)
+
+        with pytest.raises(RuntimeError, match="503"):
+            scrape._fetch_page("https://example.test/results", "results")
+
+        assert len(attempts) == scrape.HTTP_RETRIES == 5
+
+    def test_an_intermittent_refusal_is_still_recovered(self, monkeypatch, no_sleep):
+        # One retry is the point of not cutting straight to a single attempt.
+        attempts = []
+        self._install(
+            monkeypatch, [_FakeResponse(403), _FakeResponse(200, "rows")], attempts
+        )
+
+        assert scrape._fetch_page("https://example.test/results", "results") == "rows"
+        assert len(attempts) == 2
+
+    def test_success_first_time_makes_one_request(self, monkeypatch, no_sleep):
+        attempts = []
+        self._install(monkeypatch, [_FakeResponse(200, "rows")], attempts)
+
+        assert scrape._fetch_page("https://example.test/f", "fixtures") == "rows"
+        assert len(attempts) == 1
+
+
+# ---------------------------------------------------------------------------
+# RESULTS_SESSION — supplying your own fetcher
+# ---------------------------------------------------------------------------
+
+class _CustomSession:
+    """A stand-in for a user-supplied fetcher, with no `fetches` counter."""
+
+    built = 0
+
+    def __init__(self):
+        type(self).built += 1
+        self.urls = []
+
+    def fetch(self, url, wait_selector=None):
+        self.urls.append(url)
+        return ROWS
+
+    def close(self):
+        pass
+
+
+class TestResultsSessionPlugin:
+
+    def test_named_session_is_built_instead_of_the_bundled_one(self, monkeypatch):
+        monkeypatch.setenv("RESULTS_SESSION", f"{__name__}:_CustomSession")
+        before = _CustomSession.built
+
+        session = scrape._results_browser()
+
+        assert isinstance(session, _CustomSession)
+        assert _CustomSession.built == before + 1
+
+    def test_bundled_session_is_the_default(self, monkeypatch):
+        monkeypatch.delenv("RESULTS_SESSION", raising=False)
+        monkeypatch.delenv("RESULTS_BROWSER", raising=False)
+
+        from browser import BrowserSession
+
+        assert isinstance(scrape._results_browser(), BrowserSession)
+
+    def test_turning_the_browser_off_beats_a_named_session(self, monkeypatch):
+        monkeypatch.setenv("RESULTS_SESSION", f"{__name__}:_CustomSession")
+        monkeypatch.setenv("RESULTS_BROWSER", "0")
+
+        assert scrape._results_browser() is None
+
+    @pytest.mark.parametrize("spec", ["nocolon", ":missing_module", "module:"])
+    def test_a_malformed_spec_is_rejected_clearly(self, spec):
+        with pytest.raises(ValueError, match="module:attribute"):
+            scrape._load_results_session(spec)
+
+    def test_a_session_without_a_fetches_counter_still_works(self, monkeypatch):
+        # The counter is only used for the run summary; requiring it would make
+        # the protocol harder to satisfy than it needs to be.
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: [scrape.Result("12/09/26", "15:00", "A", "B", 1, 0, "G", "D")],
+        )
+        session = _CustomSession()
+
+        results = scrape.fetch_results("123", "League A", browser=session)
+
+        assert len(results) == 1
+        assert not hasattr(session, "fetches")
+
+    def test_main_reports_a_custom_session_without_a_counter(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        monkeypatch.setattr(scrape, "OUTPUT_DIR", tmp_path / "calendars")
+        monkeypatch.setattr(scrape, "LEAGUES", [("111", "League A")])
+        monkeypatch.setattr(scrape, "_results_browser", lambda: _CustomSession())
+        monkeypatch.setattr(
+            scrape, "fetch_fixtures",
+            lambda season, league: [
+                Fixture("11/10/26", "15:00", "Arnold Town", "Cotgrave", "G", "Division One")
+            ],
+        )
+        monkeypatch.setattr(
+            scrape, "fetch_results",
+            lambda season, league, browser=None: [
+                scrape.Result("12/09/26", "15:00", "Arnold Town", "Cotgrave",
+                              2, 1, "G", "Division One")
+            ],
+        )
+
+        assert scrape.main() == 0
+        payload = json.loads(
+            (tmp_path / "feeds" / "league-a" / "results.json").read_text(encoding="utf-8")
+        )
+        assert len(payload["results"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Saved pages — parsing what a browser already loaded
+# ---------------------------------------------------------------------------
+
+def _saved_page(directory, season_id, rows=1, name="Results.html"):
+    """A stand-in for a page saved from a browser, carrying its season marker."""
+    body = "".join(
+        f"<tr><td class='left'>1{i}/09/26 15:00</td>"
+        f"<td class='home-team'>East Leake Robins</td>"
+        f"<td class='score'>{i} - 0</td>"
+        f"<td class='road-team'>Cotgrave</td>"
+        f"<td class='left'>Division One</td></tr>"
+        for i in range(1, rows + 1)
+    )
+    path = directory / name
+    path.write_text(
+        f"<html><body><a href='/results/1/100000.html?selectedSeason={season_id}'>next</a>"
+        f"<table>{body}</table></body></html>",
+        encoding="utf-8",
+    )
+    return path
+
+
+class TestSavedResultsPage:
+
+    def test_a_page_is_matched_by_its_season_not_its_filename(self, tmp_path, monkeypatch):
+        # A browser names a saved page after its title, so the filename cannot
+        # be relied on to say which league it is.
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        _saved_page(tmp_path, "918978398", name="Full-Time  Results.html")
+
+        found = scrape._saved_results_page("918978398")
+
+        assert found is not None
+        assert "selectedSeason=918978398" in found[0]
+
+    def test_another_league_is_not_matched(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        _saved_page(tmp_path, "918978398")
+
+        assert scrape._saved_results_page("71450136") is None
+
+    def test_missing_directory_is_not_an_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path / "nope"))
+
+        assert scrape._saved_results_page("918978398") is None
+
+    def test_the_freshest_of_several_saves_wins(self, tmp_path, monkeypatch):
+        import os
+        import time
+
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        old = _saved_page(tmp_path, "918978398", rows=1, name="old.html")
+        new = _saved_page(tmp_path, "918978398", rows=3, name="new.html")
+        week_ago = time.time() - 7 * 86400
+        os.utime(old, (week_ago, week_ago))
+
+        html, age_days = scrape._saved_results_page("918978398")
+
+        assert len(scrape.parse_results(html)) == 3
+        assert age_days < 1
+
+
+class TestFetchResultsFromSavedPage:
+
+    def test_a_saved_page_is_used_when_everything_else_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        _saved_page(tmp_path, "918978398", rows=2)
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
+
+        results = scrape.fetch_results("918978398", "Euro Soccer", browser=None)
+
+        assert len(results) == 2
+        assert "saved page" in scrape.LAST_SOURCE
+
+    def test_a_working_fetch_is_preferred_over_a_saved_page(self, tmp_path, monkeypatch):
+        # A saved page is a fallback, not a cache: live data is fresher.
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        _saved_page(tmp_path, "918978398", rows=9)
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: ROWS)
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: (
+                [scrape.Result("12/09/26", "15:00", "A", "B", 1, 0, "G", "D")]
+                if "home-team" in html else []
+            ),
+        )
+
+        results = scrape.fetch_results("918978398", "Euro Soccer", browser=None)
+
+        assert len(results) == 1
+        assert scrape.LAST_SOURCE == "a plain fetch"
+
+    def test_the_browser_is_preferred_over_a_saved_page(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        _saved_page(tmp_path, "918978398", rows=9)
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
+        browser = _FakeBrowser(html=ROWS)
+        # Must depend on the page: rows now decide whether a response is usable,
+        # so a stub that parses anything would make the block page look fine.
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: (
+                [scrape.Result("12/09/26", "15:00", "A", "B", 1, 0, "G", "D")]
+                if "home-team" in html else []
+            ),
+        )
+
+        results = scrape.fetch_results("918978398", "Euro Soccer", browser=browser)
+
+        assert len(results) == 1
+        assert scrape.LAST_SOURCE == "the browser"
+
+    def test_no_saved_page_still_raises(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
+
+        with pytest.raises(scrape.ResultsUnavailable, match="no saved page was found"):
+            scrape.fetch_results("918978398", "Euro Soccer", browser=None)
+
+
+class TestRowsDecideOverChallengeMarkers:
+    """A page that parsed is a results page, whatever scripts it carries."""
+
+    CLOUDFLARE_SCRIPT = (
+        '<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>'
+    )
+
+    def test_a_results_page_with_cloudflare_script_is_used(self, monkeypatch):
+        page = f"<html><body>{self.CLOUDFLARE_SCRIPT}<td class='home-team'>A</td></body></html>"
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: page)
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: [scrape.Result("12/09/26", "15:00", "A", "B", 1, 0, "G", "D")],
+        )
+
+        results = scrape.fetch_results("123", "League A", browser=None)
+
+        assert len(results) == 1
+        assert scrape.LAST_SOURCE == "a plain fetch"
+
+    def test_an_interstitial_with_no_rows_is_still_a_refusal(self, monkeypatch, tmp_path):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        monkeypatch.setattr(
+            scrape, "_fetch_page",
+            lambda url, label: "<html><title>Just a moment...</title></html>",
+        )
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [])
+
+        with pytest.raises(scrape.ResultsUnavailable):
+            scrape.fetch_results("123", "League A", browser=None)
+
+    def test_an_empty_but_genuine_page_is_not_a_refusal(self, monkeypatch):
+        monkeypatch.setattr(
+            scrape, "_fetch_page",
+            lambda url, label: "<html><body>No results found</body></html>",
+        )
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [])
+
+        assert scrape.fetch_results("123", "League A", browser=None) == []

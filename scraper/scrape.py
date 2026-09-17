@@ -29,6 +29,7 @@ from compliance import (
     safe_results,
     split_results,
 )
+from browser import BrowserSession, BrowserUnavailable, is_challenge_page
 from index import write_index
 
 logging.basicConfig(
@@ -70,6 +71,49 @@ FEEDS_DIR.mkdir(exist_ok=True)
 HTTP_RETRIES = 5
 HTTP_BACKOFF_FACTOR = 2  # waits 2s, 4s, 8s, 16s, 32s between retries (+ jitter)
 HTTP_TIMEOUT = 90  # seconds
+
+# Statuses that mean "refused", not "try again": backing off five times over
+# half a minute does not change a WAF's mind, and on the results page it only
+# delays the browser fallback. One retry still covers an intermittent block.
+REFUSAL_CODES = frozenset({401, 403, 404, 410})
+REFUSAL_RETRIES = 2
+
+# Cloudflare challenges automated clients on the pages carrying scores, and
+# every Playwright mode — headless, --headless=new, headed, headed with a
+# persistent profile — is detected just the same, because Playwright exposes
+# navigator.webdriver and CDP whatever the window mode.  So rather than dress
+# the scraper up as something it is not, it can borrow the session of the
+# browser you already read those pages in: paste that session's cookies into
+# FULLTIME_COOKIE, exactly as the browser sends them
+# ("cf_clearance=...; other=..."), and set FULLTIME_USER_AGENT to that
+# browser's User-Agent.
+#
+# A clearance cookie is bound to the IP and User-Agent that earned it, so the
+# scraper has to run on the same machine and send the same User-Agent, and the
+# cookie has to be refreshed when Cloudflare expires it.  Feeds say
+# `results_unavailable` whenever it has.
+RESULTS_HTML_DIR_ENV = "RESULTS_HTML_DIR"
+DEFAULT_RESULTS_HTML_DIR = "/app/state/results"
+
+# How the last fetch_results call got its rows, for the end-of-run summary.
+LAST_SOURCE = ""
+
+COOKIE_ENV = "FULLTIME_COOKIE"
+USER_AGENT_ENV = "FULLTIME_USER_AGENT"
+
+
+def _session_cookies() -> dict[str, str]:
+    """Parse FULLTIME_COOKIE, as a browser would send it: "a=b; c=d"."""
+    raw = os.environ.get(COOKIE_ENV, "").strip()
+    if not raw:
+        return {}
+    jar: dict[str, str] = {}
+    for part in raw.split(";"):
+        name, _, value = part.partition("=")
+        if name.strip() and value.strip():
+            jar[name.strip()] = value.strip()
+    return jar
+
 
 # Explicit browser headers sent on every fetch. Full-Time's WAF rejects
 # non-browser User-Agents with HTTP 403 (observed from 2026-08-23) and also
@@ -125,27 +169,43 @@ class Result(NamedTuple):
 def _fetch_page(url: str, label: str) -> str:
     """Fetch a URL with retries and browser impersonation. Returns response text."""
     last_err: Exception | None = None
-    for attempt in range(1, HTTP_RETRIES + 1):
+    limit = HTTP_RETRIES
+    attempt = 0
+    while attempt < limit:
+        attempt += 1
         try:
             with curl_requests.Session(impersonate="chrome") as session:
                 session.headers.update(BROWSER_HEADERS)
+                # A clearance cookie is tied to the User-Agent that earned it,
+                # so an override has to reach the headers before the request.
+                user_agent = os.environ.get(USER_AGENT_ENV, "").strip()
+                if user_agent:
+                    session.headers["User-Agent"] = user_agent
+                for name, value in _session_cookies().items():
+                    session.cookies.set(name, value, domain=".thefa.com")
                 resp = session.get(url, timeout=HTTP_TIMEOUT)
+                # A refusal is a decision, not a hiccup. Full-Time does block
+                # intermittently, so one retry earns its keep, but five rounds
+                # of backoff against a settled "no" just delay the fallback
+                # that might actually work — ~34s per league, every run.
+                if resp.status_code in REFUSAL_CODES:
+                    limit = min(limit, REFUSAL_RETRIES)
                 resp.raise_for_status()
                 return resp.text
         except Exception as e:
             last_err = e
-            if attempt < HTTP_RETRIES:
+            if attempt < limit:
                 # Jittered exponential backoff so repeated daily runs don't
                 # present an identical, bot-shaped retry cadence to the WAF.
                 wait = HTTP_BACKOFF_FACTOR * (2 ** (attempt - 1))
                 wait *= 1 + random.uniform(0, 0.25)
                 log.warning(
-                    f"{label} attempt {attempt}/{HTTP_RETRIES} failed: {e} "
+                    f"{label} attempt {attempt}/{limit} failed: {e} "
                     f"— retrying in {wait:.1f}s"
                 )
                 time.sleep(wait)
             else:
-                log.error(f"{label} all {HTTP_RETRIES} attempts failed: {e}")
+                log.error(f"{label} gave up after {attempt} attempt(s): {e}")
 
     raise last_err  # type: ignore[misc]
 
@@ -231,13 +291,133 @@ def _fetch_page_js(url: str, label: str) -> str:
     return ""
 
 
-def fetch_results(season_id: str, league_name: str) -> list[Result]:
-    """Fetch all results for a given season/league."""
+def _saved_results_page(season_id: str) -> tuple[str, float] | None:
+    """A results page saved from a browser, for this season.
+
+    The pages load perfectly in a browser driven by hand — that is the whole
+    shape of the problem — so a page saved from one is ordinary HTML the parser
+    is happy with, obtained the way anyone reading the site obtains it.
+
+    Pages are identified by content rather than filename: a browser names a
+    saved page after its title, and asking someone to rename seven files over a
+    VNC session on a phone is not a plan. Every results page carries its own
+    season in the links it renders, which says which league it belongs to.
+
+    Returns (html, age in days) for the freshest match, or None.
+    """
+    directory = Path(os.environ.get(RESULTS_HTML_DIR_ENV) or DEFAULT_RESULTS_HTML_DIR)
+    if not directory.is_dir():
+        return None
+
+    marker = f"selectedSeason={season_id}"
+    best: tuple[str, float] | None = None
+    for path in sorted(directory.glob("*.htm*")):
+        try:
+            html = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            log.warning(f"Could not read saved page {path}: {e}")
+            continue
+        if marker not in html:
+            continue
+        age_days = max(0.0, (time.time() - path.stat().st_mtime) / 86400)
+        if best is None or age_days < best[1]:
+            best = (html, age_days)
+    return best
+
+
+class ResultsUnavailable(Exception):
+    """Full-Time refused the results page.
+
+    Every route that carries a score answers an automated client with a
+    Cloudflare challenge: the whole-season results listing at any page size, the
+    bare /results.html route, the per-division results link the site emits
+    itself (league + selectedDivision + selectedFixtureGroupKey), and
+    displayFixture.html for a single match.  The fixtures listing serves 1000+
+    rows to the same session, one request apart, so this is a rule scoped to
+    the pages carrying scores rather than a block on the scraper.
+
+    Raised so an empty `results` array can be published as "withheld from us"
+    rather than "nobody played" — the two are indistinguishable otherwise, and
+    a club site rendering an empty results section looks broken.
+    """
+
+
+def fetch_results(
+    season_id: str,
+    league_name: str,
+    browser: BrowserSession | None = None,
+) -> list[Result]:
+    """Fetch all results for a given season/league.
+
+    The plain fetch is tried first: it is cheap, and it succeeds outright
+    whenever the client is not being challenged — with FULLTIME_COOKIE set, for
+    instance.  Only when it is refused does *browser* get used, which is why the
+    session is started lazily; a run that never needs it never launches one.
+
+    Raises ResultsUnavailable when both are refused, so an empty results array
+    can be published as "withheld from us" rather than "nobody played".
+    """
+    global LAST_SOURCE
+    LAST_SOURCE = ""
     url = f"{RESULTS_URL}?selectedSeason={season_id}&selectedFixtureGroupKey="
+    label = f"results/{league_name}"
     log.info(f"Fetching results for {league_name} ...")
-    html = _fetch_page(url, f"results/{league_name}")
-    log.debug(f"Results HTML length: {len(html)}, tables: {html.count('<table')}")
-    return parse_results(html)
+
+    refusal = ""
+    try:
+        html = _fetch_page(url, label)
+    except Exception as e:
+        refusal = str(e)
+        html = ""
+
+    if html:
+        log.debug(f"Results HTML length: {len(html)}, tables: {html.count('<table')}")
+        results = parse_results(html)
+        # Rows decide, not the markers: Cloudflare's scripts appear on ordinary
+        # pages too, and treating a page that parsed as an interstitial would
+        # throw away results we had already been given.
+        if results or not is_challenge_page(html):
+            # A page that answers with no rows is a league that has not played
+            # yet, which is not the same as one we were refused.
+            LAST_SOURCE = "a plain fetch"
+            return results
+
+    if browser is not None:
+        log.info(f"  {label}: refused a plain fetch — retrying through the browser")
+        try:
+            rendered = browser.fetch(url, wait_selector="td.home-team")
+        except BrowserUnavailable as e:
+            log.warning(f"  {label}: no browser to retry with ({e})")
+            rendered = ""
+        except Exception as e:
+            log.warning(f"  {label}: browser fetch failed ({e})")
+            rendered = ""
+
+        if rendered:
+            results = parse_results(rendered)
+            if results or not is_challenge_page(rendered):
+                log.info(f"  {label}: {len(results)} result(s) via the browser")
+                LAST_SOURCE = "the browser"
+                return results
+
+    # Last resort, and the one that does not depend on winning an argument with
+    # a WAF: a page someone loaded in a browser and saved.
+    saved = _saved_results_page(season_id)
+    if saved:
+        saved_html, age_days = saved
+        results = parse_results(saved_html)
+        LAST_SOURCE = f"a saved page ({age_days:.1f} days old)"
+        log.info(f"  {label}: {len(results)} result(s) from a page saved "
+                 f"{age_days:.1f} day(s) ago")
+        if age_days > 7:
+            log.warning(f"  {label}: that saved page is {age_days:.0f} days old — "
+                        f"save a fresh one to pick up recent results")
+        return results
+
+    raise ResultsUnavailable(
+        f"{league_name}: results page refused ({refusal or 'challenge page'}), "
+        f"no browser got through, and no saved page was found"
+    )
 
 
 def _find_fixture_table(soup: BeautifulSoup, context: str) -> object | None:
@@ -754,12 +934,91 @@ def result_to_dict(result: Result) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Consolidation
+#
+# Rows reach a team or club feed once per (team, match): a match is scraped for
+# its home side and again for its away side, and Full-Time lists a match on its
+# fixtures page as well as, once the score is in, on its results page.  Left
+# alone that puts the same game into a feed two or three times, which is what
+# these helpers exist to prevent.
+# ---------------------------------------------------------------------------
+
+def dedupe_team_rows(rows: list[dict]) -> list[dict]:
+    """Drop rows repeating the same match for the same team, keeping the first.
+
+    A team fielded in more than one configured season — a cup run alongside its
+    league, say — is scraped once per competition, and the duplicate rows are
+    identical apart from the league they came from.
+    """
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for row in rows:
+        key = (row.get("id"), row.get("team"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def drop_settled_fixtures(
+    fixture_rows: list[dict],
+    result_rows: list[dict],
+) -> list[dict]:
+    """Remove fixtures for matches that already have a result.
+
+    Full-Time keeps a played match on its fixtures page while the league enters
+    the score, and in some competitions after that too, so the same match
+    arrives from both pages.  Fixture and result IDs are built from the same
+    key (date and both team names), so a settled match is recognisable and is
+    listed as a result only.
+    """
+    played = {row["id"] for row in result_rows if row.get("id")}
+    return [row for row in fixture_rows if row.get("id") not in played]
+
+
+def consolidate_matches(rows: list[dict]) -> list[dict]:
+    """Collapse the two sides of a club's own derby into a single row.
+
+    When both teams in a match belong to the club whose feed this is, the match
+    is scraped once for each side and the two rows carry the same match ID — so
+    a list meant to hold one row per match holds the game twice.  The home
+    side's row is kept, because it already names both teams the right way
+    round, and is marked `derby` so a consumer can tell the opposition is one of
+    the club's own teams rather than another club.
+
+    Row order is preserved; callers sort afterwards.
+    """
+    position: dict[str, int] = {}
+    out: list[dict] = []
+    for row in rows:
+        match_id = row.get("id")
+        if match_id is None:
+            out.append(row)
+            continue
+        index = position.get(match_id)
+        if index is None:
+            position[match_id] = len(out)
+            out.append(row)
+            continue
+        held = out[index]
+        if held.get("team") == row.get("team"):
+            continue  # exact duplicate of a row already held
+        # Two of the club's own teams: keep whichever row is the home side's,
+        # so `team`/`opponent` read the same way round as `home_team`/`away_team`.
+        keep = row if row.get("home_away") == "home" else held
+        out[index] = {**keep, "derby": True}
+    return out
+
+
 def write_league_feed(
     league_name: str,
     league_slug: str,
     fixtures: list[Fixture],
     results: list[Result],
     generated: str,
+    results_unavailable: bool = False,
 ) -> None:
     """Write fixtures.json and results.json for a league.
 
@@ -772,7 +1031,12 @@ def write_league_feed(
     league_dir = FEEDS_DIR / league_slug
     league_dir.mkdir(parents=True, exist_ok=True)
 
-    all_fixture_rows = [fixture_to_dict(f) for f in fixtures]
+    all_result_rows = [result_to_dict(r) for r in results]
+    # A match that has reached the results page is no longer a fixture, even
+    # while Full-Time keeps listing it as one.
+    all_fixture_rows = drop_settled_fixtures(
+        [fixture_to_dict(f) for f in fixtures], all_result_rows
+    )
     open_fixture_rows = [row for row in all_fixture_rows if not is_row_restricted(row)]
     fixtures_withheld = len(all_fixture_rows) - len(open_fixture_rows)
 
@@ -789,10 +1053,11 @@ def write_league_feed(
         f"{fixtures_withheld} withheld at U11 and below)"
     )
 
-    open_result_rows, results_withheld = safe_results([result_to_dict(r) for r in results])
+    open_result_rows, results_withheld = safe_results(all_result_rows)
     results_payload = {
         "league": league_name,
         "generated": generated,
+        **({"results_unavailable": True} if results_unavailable else {}),
         "compliance": compliance_meta(results_withheld),
         "results": sorted(
             open_result_rows,
@@ -836,6 +1101,7 @@ def write_team_feed(
     fixtures: list[Fixture],
     results: list[Result],
     generated: str,
+    results_unavailable: bool = False,
 ) -> None:
     """Write a JSON file with fixtures and results relevant to a single team.
 
@@ -867,6 +1133,10 @@ def write_team_feed(
         d["goals_for"] = r.home_score if is_home else r.away_score
         d["goals_against"] = r.away_score if is_home else r.home_score
         team_results.append(d)
+    # Full-Time lists a played match on both its pages until the league has
+    # finished with it; the settled ones belong in `results` alone.
+    team_fixtures = drop_settled_fixtures(team_fixtures, team_results)
+
     team_results, team_participation = split_results(team_results)
     results_withheld = len(team_participation)
 
@@ -891,6 +1161,7 @@ def write_team_feed(
         "team": team_name,
         "league": league_name,
         "generated": generated,
+        **({"results_unavailable": True} if results_unavailable else {}),
         "compliance": compliance_meta(results_withheld),
         "fixtures": team_fixtures,
         "results": team_results,
@@ -1246,6 +1517,7 @@ def write_club_feed(
     team_fixtures: list[dict],
     team_results: list[dict],
     generated: str,
+    results_unavailable: bool = False,
 ) -> None:
     """Write feeds/clubs/<slug>.json aggregating all teams in a club across leagues.
 
@@ -1253,29 +1525,45 @@ def write_club_feed(
     `team` and `home_away`), so restricted fixtures keep that team's name and
     lose only the opposition and venue.  Restricted results are dropped, and
     reappear in `participation` as a record that the match was played.
+
+    Each match is listed once: a game between two of the club's own teams
+    arrives as two rows and is consolidated into the home side's, marked
+    `derby`, and a match already on the results page is left out of `fixtures`.
     """
     clubs_dir = FEEDS_DIR / "clubs"
     clubs_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_club_results, club_participation = split_results(team_results)
+    # Rows arrive one per (team, match). Drop the ones a team picked up twice
+    # by playing in more than one competition, then settle every match into
+    # exactly one of the three arrays below.
+    result_rows = dedupe_team_rows(team_results)
+    fixture_rows = drop_settled_fixtures(dedupe_team_rows(team_fixtures), result_rows)
+
+    # Participation is per team — it records that a team played, and in a derby
+    # both of the club's teams did — so it is built before the two sides of a
+    # match are consolidated into the single row a match gets elsewhere.
+    publishable_results, club_participation = split_results(result_rows)
     results_withheld = len(club_participation)
 
     # As in write_team_feed: a played restricted fixture with no results row
     # becomes a participation record instead of lingering as a fixture.
-    club_fixtures, played = played_fixtures(
-        team_fixtures,
+    fixture_rows, played = played_fixtures(
+        fixture_rows,
         generated[:10],
         existing_ids={record["id"] for record in club_participation},
     )
     club_participation.extend(played)
+
+    safe_club_results = consolidate_matches(publishable_results)
     safe_club_fixtures = [
         redact_fixture(row, row.get("team")) if is_row_restricted(row) else row
-        for row in club_fixtures
+        for row in consolidate_matches(fixture_rows)
     ]
 
     payload = {
         "club": club_name,
         "generated": generated,
+        **({"results_unavailable": True} if results_unavailable else {}),
         "compliance": compliance_meta(results_withheld),
         "fixtures": sorted(safe_club_fixtures, key=lambda x: (x["date"], x["time"])),
         "results": sorted(safe_club_results, key=lambda x: (x["date"], x["time"]), reverse=True),
@@ -1354,9 +1642,63 @@ def restore_league_from_bucket(league_name: str, league_slug: str) -> int:
     return restored
 
 
-def main() -> int:
+def _load_results_session(spec: str):
+    """Build the results session named by RESULTS_SESSION ("module:attribute").
+
+    The bundled BrowserSession is refused by Full-Time's challenge, and closing
+    that gap means defeating the detection rather than working with it — which
+    this project does not do.  Supplying your own fetcher is the supported way
+    to make that choice yourself, and it keeps it in your module rather than in
+    a fork of this one.
+
+    Anything satisfying this protocol works::
+
+        class MySession:
+            # Return the page's HTML, or an interstitial if refused.
+            def fetch(self, url, wait_selector=None) -> str: ...
+
+            # Release whatever the session holds. Always called, even when the
+            # run raises.
+            def close(self) -> None: ...
+
+    An optional ``fetches`` counter, if present, is reported in the run summary.
+    Raise anything from ``fetch()`` and the league is published as
+    ``results_unavailable``, exactly as a refusal from the bundled session is.
+    """
+    module_name, _, attribute = spec.partition(":")
+    if not module_name or not attribute:
+        raise ValueError(
+            f"RESULTS_SESSION must look like 'module:attribute', got {spec!r}"
+        )
+    import importlib
+
+    module = importlib.import_module(module_name)
+    return getattr(module, attribute)()
+
+
+# Set RESULTS_BROWSER=0 to keep the run to plain fetches — useful when a
+# cookie is doing the job, or to see what a run looks like without a browser.
+def _results_browser():
+    if os.environ.get("RESULTS_BROWSER", "1").strip() in ("0", "false", "no"):
+        log.info("RESULTS_BROWSER disabled — results limited to plain fetches")
+        return None
+
+    spec = os.environ.get("RESULTS_SESSION", "").strip()
+    if spec:
+        log.info(f"Using results session from {spec}")
+        return _load_results_session(spec)
+
+    return BrowserSession()
+
+
+def _run(browser_holder: list) -> int:
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     total_teams = 0
+    # Not started here: BrowserSession starts on first use, so a run whose
+    # plain fetches all succeed never launches a browser.
+    browser = _results_browser()
+    if browser is not None:
+        browser_holder.append(browser)
 
     # league slug -> True when this run had to fall back to previously
     # published data instead of scraping fresh (surfaced in index.json).
@@ -1367,6 +1709,15 @@ def main() -> int:
     all_team_result_rows: list[dict] = []
     all_team_names: list[str] = []
 
+    # Leagues whose results Full-Time refused this run. A club playing in one of
+    # them has an incomplete results array, and its feed says so.
+    leagues_without_results: set[str] = set()
+
+    # How each league's results were obtained, summarised at the end of the run.
+    # A log this long is unreadable otherwise, and "0 results" means nothing
+    # without knowing whether we were refused or the league has not played.
+    results_report: list[tuple[str, str]] = []
+
     for season_id, league_name in LEAGUES:
         try:
             fixtures = fetch_fixtures(season_id, league_name)
@@ -1374,11 +1725,26 @@ def main() -> int:
             log.error(f"Failed to fetch fixtures for {league_name}: {e}")
             fixtures = []
 
+        results_unavailable = False
         try:
-            results = fetch_results(season_id, league_name)
+            results = fetch_results(season_id, league_name, browser=browser)
+            results_report.append((
+                league_name,
+                f"{len(results)} via {LAST_SOURCE}" if results
+                else f"none — reached via {LAST_SOURCE}, but the page held no rows",
+            ))
+        except ResultsUnavailable as e:
+            log.error(
+                f"RESULTS UNAVAILABLE — {e}. Feeds for this league will say so; "
+                f"an empty results array does not mean no match was played."
+            )
+            results = []
+            results_unavailable = True
+            results_report.append((league_name, "REFUSED — published as unavailable"))
         except Exception as e:
             log.error(f"Failed to fetch results for {league_name}: {e}")
             results = []
+            results_report.append((league_name, f"FAILED — {e}"))
 
         if not fixtures and not results:
             log.warning(f"No fresh data found for {league_name}")
@@ -1387,6 +1753,15 @@ def main() -> int:
             if restore_league_from_bucket(league_name, league_slug_name):
                 log.warning(f"  {league_name}: kept previously published data")
             continue
+
+        if fixtures and not results and not results_unavailable:
+            # Not fatal — a league genuinely has no results before its first
+            # round — but it is also what a silently broken results scrape
+            # looks like, and it leaves every played match out of the feeds.
+            log.warning(
+                f"  {league_name}: {len(fixtures)} fixtures but no results — "
+                f"played matches will be missing from results and participation"
+            )
 
         # Group fixtures/results by team name
         teams_fixtures: dict[str, list[Fixture]] = {}
@@ -1419,7 +1794,13 @@ def main() -> int:
                 log.info(f"    {filename.name} ({len(team_fixtures)} fixtures)")
 
         # --- JSON feeds (league + team level) ---
-        write_league_feed(league_name, league_slug_name, fixtures, results, generated)
+        if results_unavailable:
+            leagues_without_results.add(league_name)
+
+        write_league_feed(
+            league_name, league_slug_name, fixtures, results, generated,
+            results_unavailable=results_unavailable,
+        )
 
         team_index_entries: list[dict] = []
         for team_name in all_teams:
@@ -1429,6 +1810,7 @@ def main() -> int:
                 teams_fixtures.get(team_name, []),
                 teams_results.get(team_name, []),
                 generated,
+                results_unavailable=results_unavailable,
             )
             team_index_entries.append({"name": team_name, "slug": team_slug_name})
 
@@ -1475,17 +1857,26 @@ def main() -> int:
 
     for club_name in all_clubs:
         club_slug_name = slug(club_name)
+        club_rows = club_fixtures.get(club_name, []) + club_results.get(club_name, [])
+        club_leagues = {row["league"] for row in club_rows if row.get("league")}
         write_club_feed(
             club_name, club_slug_name,
             club_fixtures.get(club_name, []),
             club_results.get(club_name, []),
             generated,
+            results_unavailable=bool(club_leagues & leagues_without_results),
         )
         teams_in_club = sorted(
             {r["team"] for r in club_fixtures.get(club_name, [])}
             | {r["team"] for r in club_results.get(club_name, [])}
         )
         log.info(f"  Club feed: {club_slug_name} ({len(teams_in_club)} teams)")
+
+    if results_report:
+        log.info("\nResults per league:")
+        width = max(len(name) for name, _ in results_report)
+        for name, outcome in results_report:
+            log.info(f"  {name:<{width}}  {outcome}")
 
     write_index(feeds_dir=FEEDS_DIR, generated=generated, from_cache=from_cache)
     log.info(
@@ -1501,6 +1892,16 @@ def main() -> int:
         )
         return 1
     return 0
+
+
+def main() -> int:
+    """Run the scrape, making sure any browser it started is shut down."""
+    browser_holder: list[BrowserSession] = []
+    try:
+        return _run(browser_holder)
+    finally:
+        for session in browser_holder:
+            session.close()
 
 
 if __name__ == "__main__":
