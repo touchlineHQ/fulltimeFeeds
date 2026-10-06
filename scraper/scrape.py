@@ -1002,6 +1002,84 @@ def result_to_dict(result: Result) -> dict:
     }
 
 
+def _fa_date(iso: str) -> str:
+    """Turn a published YYYY-MM-DD back into the DD/MM/YY the scraper keys on."""
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d").strftime("%d/%m/%y")
+    except ValueError:
+        return iso
+
+
+def result_from_published(row: dict) -> Result | None:
+    """Rebuild a Result from a row already published in a team feed."""
+    home, away, date = row.get("home_team"), row.get("away_team"), row.get("date")
+    if not home or not away or not date:
+        return None
+    return Result(
+        date=_fa_date(date),
+        time=row.get("time") or "",
+        home_team=home,
+        away_team=away,
+        home_score=row.get("home_score"),
+        away_score=row.get("away_score"),
+        venue=row.get("venue") or "",
+        division_label=row.get("division") or "",
+    )
+
+
+def load_published_history(league_slug: str) -> tuple[list[Result], dict[str, list[dict]]]:
+    """Last published scores for a league, read before this run overwrites them.
+
+    A refused results page must not blank the roundup. Team feeds are the copy
+    that still names both sides of an open-age result and still has the
+    participation records for U11 and below. A file that holds neither is an
+    earlier wipe, and is ignored.
+    """
+    team_dir = FEEDS_DIR / league_slug / "teams"
+    results: list[Result] = []
+    seen: set[str] = set()
+    participation: dict[str, list[dict]] = {}
+    if not team_dir.is_dir():
+        return results, participation
+    for path in sorted(team_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        team = payload.get("team") or ""
+        kept = []
+        for record in payload.get("participation") or []:
+            if not record.get("id") or record.get("played") is False:
+                continue
+            if payload.get("league") and not record.get("league"):
+                record = dict(record)
+                record["league"] = payload["league"]
+            kept.append(record)
+        if kept and team:
+            participation[team] = kept
+        for row in payload.get("results") or []:
+            result = result_from_published(row)
+            if result is None:
+                continue
+            match_id = row.get("id") or _match_id(result.date, result.home_team, result.away_team)
+            if match_id in seen:
+                continue
+            seen.add(match_id)
+            results.append(result)
+    return results, participation
+
+
+def _merge_participation(base: list[dict], extra: list[dict]) -> None:
+    """Append participation records not already present, in place."""
+    seen = {record.get("id") for record in base}
+    for record in extra:
+        record_id = record.get("id")
+        if not record_id or record_id in seen or record.get("played") is False:
+            continue
+        seen.add(record_id)
+        base.append(record)
+
+
 # ---------------------------------------------------------------------------
 # Consolidation
 #
@@ -1308,6 +1386,7 @@ def write_team_feed(
     results: list[Result],
     generated: str,
     results_unavailable: bool = False,
+    extra_participation: list[dict] | None = None,
 ) -> None:
     """Write a JSON file with fixtures and results relevant to a single team.
 
@@ -1345,6 +1424,7 @@ def write_team_feed(
 
     team_results, team_participation = split_results(team_results)
     results_withheld = len(team_participation)
+    _merge_participation(team_participation, extra_participation or [])
 
     # A restricted fixture the league never moved onto its results page was
     # still played once its date has passed; record it rather than leave it
@@ -1724,6 +1804,7 @@ def write_club_feed(
     team_results: list[dict],
     generated: str,
     results_unavailable: bool = False,
+    extra_participation: list[dict] | None = None,
 ) -> None:
     """Write feeds/clubs/<slug>.json aggregating all teams in a club across leagues.
 
@@ -1750,6 +1831,7 @@ def write_club_feed(
     # match are consolidated into the single row a match gets elsewhere.
     publishable_results, club_participation = split_results(result_rows)
     results_withheld = len(club_participation)
+    _merge_participation(club_participation, extra_participation or [])
 
     # As in write_team_feed: a played restricted fixture with no results row
     # becomes a participation record instead of lingering as a fixture.
@@ -1914,6 +1996,7 @@ def _run(browser_holder: list) -> int:
     all_team_fixture_rows: list[dict] = []
     all_team_result_rows: list[dict] = []
     all_team_names: list[str] = []
+    all_retained_participation: list[dict] = []
 
     # Leagues whose results Full-Time refused this run. A club playing in one of
     # them has an incomplete results array, and its feed says so.
@@ -1962,6 +2045,26 @@ def _run(browser_holder: list) -> int:
                 log.warning(f"  {league_name}: kept previously published data")
             continue
 
+        # The roundup is built from these feeds. A refused results page used to
+        # replace last week's scores with an empty array, which is what made a
+        # club's weekend look like it never happened. Keep what was published.
+        retained_participation: dict[str, list[dict]] = {}
+        if (results_unavailable or results_failed) and not results:
+            retained, retained_participation = load_published_history(slug(league_name))
+            kept_records = sum(len(rows) for rows in retained_participation.values())
+            if retained or kept_records:
+                log.warning(
+                    f"  {league_name}: results page not read — keeping "
+                    f"{len(retained)} previously published result(s) and "
+                    f"{kept_records} participation record(s)"
+                )
+                results = retained
+                note = (
+                    f"kept {len(retained)} published result(s), "
+                    f"{kept_records} participation record(s)"
+                )
+                results_report[-1] = (league_name, f"{results_report[-1][1]} — {note}")
+
         if fixtures and not results and not results_unavailable:
             # Not fatal — a league genuinely has no results before its first
             # round — but it is also what a silently broken results scrape
@@ -2006,8 +2109,12 @@ def _run(browser_holder: list) -> int:
         teams_results = _by_team(results)
 
         # Teams that only have a postponed fixture must still be rewritten,
-        # or the old calendar keeps the match we are trying to remove.
-        all_teams = sorted(set(raw_by_team) | set(teams_results))
+        # or the old calendar keeps the match we are trying to remove. A team
+        # whose only trace is a retained participation record has to be
+        # rewritten too, or that record is dropped on the way to the club feed.
+        all_teams = sorted(set(raw_by_team) | set(teams_results) | set(retained_participation))
+        for records in retained_participation.values():
+            all_retained_participation.extend(records)
 
         league_slug_name = slug(league_name)
         league_dir = OUTPUT_DIR / league_slug_name
@@ -2036,12 +2143,13 @@ def _run(browser_holder: list) -> int:
                 )
 
         # --- JSON feeds (league + team level) ---
-        if results_unavailable:
+        results_not_read = results_unavailable or results_failed
+        if results_not_read:
             leagues_without_results.add(league_name)
 
         write_league_feed(
             league_name, league_slug_name, fixtures, results, generated,
-            results_unavailable=results_unavailable,
+            results_unavailable=results_not_read,
         )
 
         team_index_entries: list[dict] = []
@@ -2052,7 +2160,8 @@ def _run(browser_holder: list) -> int:
                 teams_fixtures.get(team_name, []),
                 teams_results.get(team_name, []),
                 generated,
-                results_unavailable=results_unavailable,
+                results_unavailable=results_not_read,
+                extra_participation=retained_participation.get(team_name, []),
             )
             team_index_entries.append({"name": team_name, "slug": team_slug_name})
 
@@ -2095,22 +2204,31 @@ def _run(browser_holder: list) -> int:
         club_name = infer_club_name(row["team"], prefix_counts)
         club_results.setdefault(club_name, []).append(row)
 
-    all_clubs = sorted(set(club_fixtures) | set(club_results))
+    club_participation_extra: dict[str, list[dict]] = {}
+    for record in all_retained_participation:
+        club_name = infer_club_name(record.get("team") or "", prefix_counts)
+        club_participation_extra.setdefault(club_name, []).append(record)
+
+    all_clubs = sorted(set(club_fixtures) | set(club_results) | set(club_participation_extra))
 
     for club_name in all_clubs:
         club_slug_name = slug(club_name)
+        extra = club_participation_extra.get(club_name, [])
         club_rows = club_fixtures.get(club_name, []) + club_results.get(club_name, [])
         club_leagues = {row["league"] for row in club_rows if row.get("league")}
+        club_leagues.update(record["league"] for record in extra if record.get("league"))
         write_club_feed(
             club_name, club_slug_name,
             club_fixtures.get(club_name, []),
             club_results.get(club_name, []),
             generated,
             results_unavailable=bool(club_leagues & leagues_without_results),
+            extra_participation=extra,
         )
         teams_in_club = sorted(
             {r["team"] for r in club_fixtures.get(club_name, [])}
             | {r["team"] for r in club_results.get(club_name, [])}
+            | {r.get("team") for r in extra if r.get("team")}
         )
         log.info(f"  Club feed: {club_slug_name} ({len(teams_in_club)} teams)")
 

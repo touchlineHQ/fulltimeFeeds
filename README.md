@@ -245,7 +245,12 @@ above if the situation changes.
 
 So `fetch_results` raises `ResultsUnavailable` when the page is refused, and
 every feed for an affected league carries `"results_unavailable": true` beside
-its `generated` timestamp:
+its `generated` timestamp. Results and participation already published for that
+league are kept, so a club roundup does not lose the weekend that was scraped
+yesterday. The flag then means "not refreshed", not "throw these scores away".
+
+An empty `results` array with the flag means there was nothing to keep — the
+first run was refused, or an earlier run had already wiped the file:
 
 ```json
 {
@@ -256,14 +261,12 @@ its `generated` timestamp:
 }
 ```
 
-**An empty `results` array on such a feed means the data was withheld from the
-scraper, not that no match was played** — render "results unavailable" rather
-than an empty results section, which reads as a broken page. The flag is absent
-whenever results were reachable, so absent or `false` means the array is real.
-`participation` is affected the same way: a U11-and-below match that never
-appears on a reachable page cannot be recorded as played, so participation
-covers only restricted fixtures whose date has passed while they sit on the
-fixtures page.
+**That empty array means the data was withheld from the scraper, not that no
+match was played** — render "results unavailable" rather than an empty results
+section. The flag is absent whenever results were reachable, so absent or
+`false` means the array is real. Participation for U11 and below is kept the
+same way. What can still be recorded without a results page is a restricted
+fixture whose date has passed while it sits on the fixtures page.
 
 Every Playwright mode is challenged too — headless, `--headless=new`, headed,
 and headed with a persistent profile — because Playwright exposes

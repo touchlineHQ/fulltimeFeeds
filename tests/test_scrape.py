@@ -945,6 +945,54 @@ class TestResultsUnavailableFlag:
         assert league["results_unavailable"] is True
         assert team["results_unavailable"] is True
 
+    def test_a_refused_page_keeps_the_roundup(self, tmp_path, monkeypatch):
+        # The weekly roundup is this feed. Refusing the results page must not
+        # replace a weekend that was already published with an empty array.
+        feeds = tmp_path / "feeds"
+        monkeypatch.setattr(scrape, "FEEDS_DIR", feeds)
+        monkeypatch.setattr(scrape, "OUTPUT_DIR", tmp_path / "calendars")
+        monkeypatch.setattr(scrape, "LEAGUES", [("111", "League A")])
+        scrape.write_team_feed(
+            "East Leake Robins", "east-leake-robins", "League A", "league-a",
+            [],
+            [scrape.Result(
+                date="03/10/26", time="15:00",
+                home_team="East Leake Robins", away_team="AJ Sport",
+                home_score=8, away_score=1,
+                venue="Costock Road", division_label="Premier",
+            )],
+            "2026-10-05T06:00:00Z",
+        )
+        scrape.write_team_feed(
+            "East Leake Bantams U10", "east-leake-bantams-u10", "League A", "league-a",
+            [Fixture(
+                "03/10/26", "10:00", "East Leake Bantams U10",
+                "Some Opposition U10", "Home Ground", "U10",
+            )],
+            [],
+            "2026-10-05T06:00:00Z",
+        )
+        monkeypatch.setattr(
+            scrape, "fetch_fixtures",
+            lambda season, league: [
+                Fixture("11/10/26", "15:00", "East Leake Robins", "Parkhall FC", "Away", "Premier"),
+            ],
+        )
+
+        def refused(season, league, browser=None):
+            raise scrape.ResultsUnavailable(f"{league}: results page refused")
+
+        monkeypatch.setattr(scrape, "fetch_results", refused)
+
+        assert scrape.main() == 0
+
+        club = json.loads((feeds / "clubs" / "east-leake.json").read_text(encoding="utf-8"))
+        assert club["results_unavailable"] is True
+        scored = [row for row in club["results"] if row["away_team"] == "AJ Sport"]
+        assert scored[0]["home_score"] == 8
+        assert scored[0]["away_score"] == 1
+        assert any(row["team"] == "East Leake Bantams U10" for row in club["participation"])
+
 
 # ---------------------------------------------------------------------------
 # Borrowing the operator's own browser session
