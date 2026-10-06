@@ -839,6 +839,25 @@ class TestFetchResults:
 
         assert len(scrape.fetch_results("123", "League A")) == 1
 
+    def test_no_date_url_returns_results_after_whole_season_fetch_raises(self, monkeypatch):
+        seen = []
+        result = self._result()
+
+        def fetch(url, label):
+            seen.append(url)
+            if "selectedDateCode=all" in url:
+                raise RuntimeError("HTTP Error 403")
+            return "<html>rows</html>"
+
+        monkeypatch.setattr(scrape, "_fetch_page", fetch)
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [result] if html else [])
+        monkeypatch.setattr(scrape, "_fetch_page_js", lambda url, label: "")
+        monkeypatch.setattr(scrape, "_saved_results_page", lambda season: None)
+
+        assert scrape.fetch_results("123", "League A") == [result]
+        assert seen == [scrape._results_url("123"), scrape._results_url("123", date_code="")]
+        assert scrape.LAST_SOURCE == "a plain fetch"
+
     def test_refused_fetch_raises_results_unavailable(self, monkeypatch):
         def blocked(url, label):
             raise RuntimeError("HTTP Error 403")
@@ -944,6 +963,54 @@ class TestResultsUnavailableFlag:
         assert club["results_unavailable"] is True
         assert league["results_unavailable"] is True
         assert team["results_unavailable"] is True
+
+    def test_a_refused_page_keeps_the_roundup(self, tmp_path, monkeypatch):
+        # The weekly roundup is this feed. Refusing the results page must not
+        # replace a weekend that was already published with an empty array.
+        feeds = tmp_path / "feeds"
+        monkeypatch.setattr(scrape, "FEEDS_DIR", feeds)
+        monkeypatch.setattr(scrape, "OUTPUT_DIR", tmp_path / "calendars")
+        monkeypatch.setattr(scrape, "LEAGUES", [("111", "League A")])
+        scrape.write_team_feed(
+            "East Leake Robins", "east-leake-robins", "League A", "league-a",
+            [],
+            [scrape.Result(
+                date="03/10/26", time="15:00",
+                home_team="East Leake Robins", away_team="AJ Sport",
+                home_score=8, away_score=1,
+                venue="Costock Road", division_label="Premier",
+            )],
+            "2026-10-05T06:00:00Z",
+        )
+        scrape.write_team_feed(
+            "East Leake Bantams U10", "east-leake-bantams-u10", "League A", "league-a",
+            [Fixture(
+                "03/10/26", "10:00", "East Leake Bantams U10",
+                "Some Opposition U10", "Home Ground", "U10",
+            )],
+            [],
+            "2026-10-05T06:00:00Z",
+        )
+        monkeypatch.setattr(
+            scrape, "fetch_fixtures",
+            lambda season, league: [
+                Fixture("11/10/26", "15:00", "East Leake Robins", "Parkhall FC", "Away", "Premier"),
+            ],
+        )
+
+        def refused(season, league, browser=None):
+            raise scrape.ResultsUnavailable(f"{league}: results page refused")
+
+        monkeypatch.setattr(scrape, "fetch_results", refused)
+
+        assert scrape.main() == 0
+
+        club = json.loads((feeds / "clubs" / "east-leake.json").read_text(encoding="utf-8"))
+        assert club["results_unavailable"] is True
+        scored = [row for row in club["results"] if row["away_team"] == "AJ Sport"]
+        assert scored[0]["home_score"] == 8
+        assert scored[0]["away_score"] == 1
+        assert any(row["team"] == "East Leake Bantams U10" for row in club["participation"])
 
 
 # ---------------------------------------------------------------------------
@@ -1510,8 +1577,88 @@ class TestCalledOffStatus:
         assert fixtures[0].division_label == "U12 Sun Winter Div 7 Blue"
         assert is_called_off(fixtures[1].status)
 
+    def test_a_score_on_the_fixtures_page_is_a_result(self):
+        html = "<table><tr><td>Home Team</td></tr>" + _FIXTURE_ROW.format(
+            date="04/10/26", time="11:15",
+            home="East Leake Bantams Green U12",
+            away="Stanton Ilkeston Scorpions U12",
+            score="3 - 2", venue="Costock Road",
+            division="U12 Sun", status="",
+        ) + _FIXTURE_ROW.format(
+            date="03/10/26", time="10:00",
+            home="East Leake Bantams U10", away="Opposition U10",
+            score="X - X", venue="Home", division="U10", status="",
+        ) + _FIXTURE_ROW.format(
+            date="11/10/26", time="10:00",
+            home="East Leake Robins", away="AJ Sport",
+            score="VS", venue="Costock", division="Premier", status="",
+        ) + "</table>"
+
+        fixtures, played = scrape.parse_fixture_page(html)
+
+        assert [f.home_team for f in fixtures] == ["East Leake Robins"]
+        scored = {row.home_team: (row.home_score, row.away_score) for row in played}
+        assert scored["East Leake Bantams Green U12"] == (3, 2)
+        assert scored["East Leake Bantams U10"] == (None, None)
+
+    def test_results_are_asked_for_the_whole_season_first(self, monkeypatch):
+        seen = []
+
+        def fetch(url, label):
+            seen.append(url)
+            return "<html><td class='home-team'>A</td></html>"
+
+        monkeypatch.setattr(scrape, "_fetch_page", fetch)
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: [scrape.Result("04/10/26", "15:00", "East Leake Robins", "AJ Sport", 8, 1, "", "Premier")],
+        )
+
+        assert len(scrape.fetch_results("876713597", "YEL Sunday", browser=None)) == 1
+        assert seen[0].startswith("https://fulltime.thefa.com/results/")
+        assert "selectedDateCode=all" in seen[0]
+        assert "selectedSeason=876713597" in seen[0]
+        assert len(seen) == 1
+
 
 class TestScheduledFixtures:
+
+    @pytest.mark.parametrize("error_type", [RuntimeError, scrape.ResultsUnavailable])
+    @pytest.mark.parametrize("result_source", ["published", "fixtures"])
+    def test_failed_results_fetch_keeps_past_fixture_with_other_scores(
+        self, tmp_path, monkeypatch, error_type, result_source,
+    ):
+        feeds = tmp_path / "feeds"
+        monkeypatch.setattr(scrape, "FEEDS_DIR", feeds)
+        monkeypatch.setattr(scrape, "OUTPUT_DIR", tmp_path / "calendars")
+        monkeypatch.setattr(scrape, "LEAGUES", [("111", "League A")])
+        monkeypatch.setattr(scrape, "_results_browser", lambda: None)
+        today = datetime.now(timezone.utc).date()
+        past_on = (today - timedelta(days=9)).strftime("%d/%m/%y")
+        played_on = (today - timedelta(days=30)).strftime("%d/%m/%y")
+        past = _fx(past_on, "Home U12", "Away U12")
+        result = _rs(played_on, "Home U12", "Other U12")
+        if result_source == "published":
+            scrape.write_team_feed(
+                "Home U12", "home-u12", "League A", "league-a", [], [result],
+                "2026-10-05T06:00:00Z",
+            )
+        monkeypatch.setattr(
+            scrape, "fetch_fixtures",
+            lambda season, league: ([past], [result] if result_source == "fixtures" else []),
+        )
+
+        def failed(season, league, browser=None):
+            raise error_type("results fetch failed")
+
+        monkeypatch.setattr(scrape, "fetch_results", failed)
+
+        assert scrape.main() == 0
+        fixtures = json.loads((feeds / "league-a" / "fixtures.json").read_text())
+        results = json.loads((feeds / "league-a" / "results.json").read_text())
+        assert [row["away_team"] for row in fixtures["fixtures"]] == ["Away U12"]
+        assert [row["away_team"] for row in results["results"]] == ["Other U12"]
+        assert results["results_unavailable"] is True
 
     def test_explicit_postponement_is_dropped_even_in_the_future(self):
         upcoming = _fx("11/10/26", "Home U12", "Away U12", status="Postponed")

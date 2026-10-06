@@ -243,9 +243,20 @@ it only costs a browser launch per league per run. `scripts/diagnose_results.py`
 `scripts/discover_routes.py` and `scripts/probe_real_results.py` reproduce the
 above if the situation changes.
 
-So `fetch_results` raises `ResultsUnavailable` when the page is refused, and
-every feed for an affected league carries `"results_unavailable": true` beside
-its `generated` timestamp:
+So `fetch_results` asks for the whole season first (`selectedDateCode=all`),
+which is what a working run was doing — without that filter Full-Time answers
+for one period, often an empty one. It then tries the page with no date
+filter, the browser session, the Playwright render, and a saved page. A score
+still sitting on the fixtures page (`3 - 1`, or `X - X` where it is withheld)
+is read as a result too. `ResultsUnavailable` is raised only when every one of
+those was refused, and every feed for an affected league carries
+`"results_unavailable": true` beside its `generated` timestamp. Results and
+participation already published for that league are kept, so a club roundup
+does not lose the weekend that was scraped yesterday. The flag then means "not
+refreshed", not "throw these scores away".
+
+An empty `results` array with the flag means there was nothing to keep — the
+first run was refused, or an earlier run had already wiped the file:
 
 ```json
 {
@@ -256,14 +267,12 @@ its `generated` timestamp:
 }
 ```
 
-**An empty `results` array on such a feed means the data was withheld from the
-scraper, not that no match was played** — render "results unavailable" rather
-than an empty results section, which reads as a broken page. The flag is absent
-whenever results were reachable, so absent or `false` means the array is real.
-`participation` is affected the same way: a U11-and-below match that never
-appears on a reachable page cannot be recorded as played, so participation
-covers only restricted fixtures whose date has passed while they sit on the
-fixtures page.
+**That empty array means the data was withheld from the scraper, not that no
+match was played** — render "results unavailable" rather than an empty results
+section. The flag is absent whenever results were reachable, so absent or
+`false` means the array is real. Participation for U11 and below is kept the
+same way. What can still be recorded without a results page is a restricted
+fixture whose date has passed while it sits on the fixtures page.
 
 Every Playwright mode is challenged too — headless, `--headless=new`, headed,
 and headed with a persistent profile — because Playwright exposes
