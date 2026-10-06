@@ -243,17 +243,18 @@ it only costs a browser launch per league per run. `scripts/diagnose_results.py`
 `scripts/discover_routes.py` and `scripts/probe_real_results.py` reproduce the
 above if the situation changes.
 
-So `fetch_results` asks for the whole season first (`selectedDateCode=all`),
-which is what a working run was doing — without that filter Full-Time answers
-for one period, often an empty one. It then tries the page with no date
-filter, the browser session, the Playwright render, and a saved page. A score
-still sitting on the fixtures page (`3 - 1`, or `X - X` where it is withheld)
-is read as a result too. `ResultsUnavailable` is raised only when every one of
-those was refused, and every feed for an affected league carries
-`"results_unavailable": true` beside its `generated` timestamp. Results and
-participation already published for that league are kept, so a club roundup
-does not lose the weekend that was scraped yesterday. The flag then means "not
-refreshed", not "throw these scores away".
+So `fetch_results` makes one plain request for
+`/results/1/100000.html?selectedSeason=…&selectedFixtureGroupKey=`, then, only
+if that is refused, the headed browser session the cron already runs. It does
+not ask for `selectedDateCode=all`: that is a different URL, Full-Time refuses
+it, and requesting it first is what left every league `results_unavailable` on
+the 20:09 run. A score still sitting on the fixtures page (`3 - 1`, or
+`X - X` where it is withheld) is read as a result too. `ResultsUnavailable` is
+raised when the results page is refused, and every feed for an affected league
+carries `"results_unavailable": true` beside its `generated` timestamp. Results
+and participation already published for that league are kept, so a club
+roundup does not lose the weekend that was scraped yesterday. The flag then
+means "not refreshed", not "throw these scores away".
 
 An empty `results` array with the flag means there was nothing to keep — the
 first run was refused, or an earlier run had already wiped the file:

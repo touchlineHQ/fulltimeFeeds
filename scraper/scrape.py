@@ -226,27 +226,6 @@ def fetch_fixtures(season_id: str, league_name: str) -> tuple[list[Fixture], lis
     return fixtures, played
 
 
-def _results_url(season_id: str, date_code: str = "all") -> str:
-    """Full-Time's results page for a whole season.
-
-    Asked for without ``selectedDateCode`` the results page answers for one
-    period only — often one with no matches in it — which is how a season
-    full of played matches comes back empty. ``all`` asks for the season.
-    This is the request the working cron was making.
-    """
-    params = [f"selectedSeason={season_id}"]
-    if date_code:
-        params.append(f"selectedDateCode={date_code}")
-    params += [
-        "selectedFixtureGroupAgeGroupId=",
-        "selectedFixtureGroupKey=",
-        "selectedRelation=",
-        "selectedClub=",
-        "selectedTeam=",
-    ]
-    return f"{RESULTS_URL}?" + "&".join(params)
-
-
 def _fetch_page_js(url: str, label: str) -> str:
     """Fetch a JavaScript-rendered page using Playwright (headless Chromium).
 
@@ -399,64 +378,42 @@ def fetch_results(
     league_name: str,
     browser: BrowserSession | None = None,
 ) -> list[Result]:
-    """Fetch a season's results, trying each way the page will give them up.
+    """Fetch all results for a given season/league.
 
-    Cheapest first: the whole-season URL (``selectedDateCode=all``), then the
-    same page with no date filter, then the browser session, then the
-    Playwright render the working cron used, then a page saved from a browser.
-    A page with rows is the answer, even if it also carries a challenge
-    script. A genuine page with no rows is a league that has not played, and
-    is not a refusal. Only when every route was blocked is ResultsUnavailable
-    raised.
+    One plain request, then the headed browser session the cron already runs.
+    That is the sequence that was filling the feeds. ``selectedDateCode=all``
+    is a different request and Full-Time refuses it, so it is not used: asking
+    for it first is what made the 20:09 run report every league unavailable.
+
+    Raises ResultsUnavailable when the page is refused, so an empty results
+    array can be kept as "withheld from us" rather than published over last
+    week's scores.
     """
     global LAST_SOURCE
     LAST_SOURCE = ""
+    url = f"{RESULTS_URL}?selectedSeason={season_id}&selectedFixtureGroupKey="
     label = f"results/{league_name}"
     log.info(f"Fetching results for {league_name} ...")
+
     refusal = ""
-    saw_real_page = False
-
-    def consider(html: str, source: str, detail: str) -> list[Result] | None:
-        nonlocal saw_real_page
-        global LAST_SOURCE
-        if not html:
-            return None
-        log.debug(f"  {detail}: {len(html)} bytes, {html.count('<table')} tables")
-        found = parse_results(html)
-        if found:
-            LAST_SOURCE = source
-            log.info(f"  {league_name}: {len(found)} result(s) via {detail}")
-            return found
-        if not is_challenge_page(html):
-            saw_real_page = True
-            log.warning(f"  {league_name}: no results via {detail}")
-        return None
-
     try:
-        html = _fetch_page(_results_url(season_id), label)
+        html = _fetch_page(url, label)
     except Exception as e:
         refusal = str(e)
         html = ""
-    found = consider(html, "a plain fetch", "the whole-season URL")
-    if found is not None:
-        return found
 
-    try:
-        html = _fetch_page(_results_url(season_id, date_code=""), label)
-    except Exception as e:
-        refusal = refusal or str(e)
-        html = ""
-    found = consider(html, "a plain fetch", "no date filter")
-    if found is not None:
-        return found
-
-    if saw_real_page:
-        LAST_SOURCE = "a plain fetch"
-        return []
+    if html:
+        log.debug(f"Results HTML length: {len(html)}, tables: {html.count('<table')}")
+        results = parse_results(html)
+        # Rows decide, not the markers: Cloudflare's scripts appear on ordinary
+        # pages too, and treating a page that parsed as an interstitial would
+        # throw away results we had already been given.
+        if results or not is_challenge_page(html):
+            LAST_SOURCE = "a plain fetch"
+            return results
 
     if browser is not None:
         log.info(f"  {label}: refused a plain fetch — retrying through the browser")
-        url = _results_url(season_id)
         try:
             rendered = browser.fetch(url, wait_selector="td.home-team")
         except BrowserUnavailable as e:
@@ -465,35 +422,29 @@ def fetch_results(
         except Exception as e:
             log.warning(f"  {label}: browser fetch failed ({e})")
             rendered = ""
-        found = consider(rendered, "the browser", "the browser")
-        if found is not None:
-            return found
-        if saw_real_page:
-            LAST_SOURCE = "the browser"
-            return []
 
-    rendered = _fetch_page_js(_results_url(season_id), label)
-    found = consider(rendered, "a browser render", "a browser render")
-    if found is not None:
-        return found
-    if saw_real_page:
-        LAST_SOURCE = "a browser render"
-        return []
+        if rendered:
+            results = parse_results(rendered)
+            if results or not is_challenge_page(rendered):
+                log.info(f"  {label}: {len(results)} result(s) via the browser")
+                LAST_SOURCE = "the browser"
+                return results
 
     saved = _saved_results_page(season_id)
     if saved:
         saved_html, age_days = saved
-        found = consider(saved_html, f"a saved page ({age_days:.1f} days old)", "a saved page")
-        if found is not None:
-            if age_days > 7:
-                log.warning(
-                    f"  {label}: that saved page is {age_days:.0f} days old — "
-                    f"save a fresh one to pick up recent results"
-                )
-            return found
-        if saw_real_page:
-            LAST_SOURCE = f"a saved page ({age_days:.1f} days old)"
-            return []
+        results = parse_results(saved_html)
+        LAST_SOURCE = f"a saved page ({age_days:.1f} days old)"
+        log.info(
+            f"  {label}: {len(results)} result(s) from a page saved "
+            f"{age_days:.1f} day(s) ago"
+        )
+        if age_days > 7:
+            log.warning(
+                f"  {label}: that saved page is {age_days:.0f} days old — "
+                f"save a fresh one to pick up recent results"
+            )
+        return results
 
     raise ResultsUnavailable(
         f"{league_name}: results page refused ({refusal or 'challenge page'}), "
