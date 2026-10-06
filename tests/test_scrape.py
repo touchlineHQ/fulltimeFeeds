@@ -7,7 +7,7 @@ Run with: pytest tests/
 import json
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -24,6 +24,9 @@ from scrape import (
     parse_results,
     parse_fixtures,
     restore_league_from_bucket,
+    is_called_off,
+    scheduled_fixtures,
+    team_calendar_ics,
 )
 import scrape
 
@@ -1442,3 +1445,233 @@ class TestRowsDecideOverChallengeMarkers:
         monkeypatch.setattr(scrape, "parse_results", lambda html: [])
 
         assert scrape.fetch_results("123", "League A", browser=None) == []
+
+
+# ---------------------------------------------------------------------------
+# Postponed fixtures come off; played matches stay on the calendar
+# ---------------------------------------------------------------------------
+
+TODAY = "2026-10-06"
+
+_FIXTURE_ROW = """
+<tr>
+  <td class="color-dark-grey bold cell-divider">L</td>
+  <td class="left cell-divider">{date} {time}</td>
+  <td class="home-team">{home}</td>
+  <td class="team-logo"></td>
+  <td class="score">{score}</td>
+  <td class="team-logo"></td>
+  <td class="road-team">{away}</td>
+  <td class="left cell-divider">{venue}</td>
+  <td class="left cell-divider">{division}</td>
+  <td class="status-notes">{status}</td>
+</tr>
+"""
+
+
+def _fx(date, home, away, division="U12 Sun", status="", time="11:30"):
+    return Fixture(date, time, home, away, "Ground", division, status)
+
+
+def _rs(date, home, away, hs=1, as_=0, division="U12 Sun"):
+    return scrape.Result(date, "10:00", home, away, hs, as_, "", division)
+
+
+class TestCalledOffStatus:
+
+    @pytest.mark.parametrize("status", [
+        "Postponed", "Match postponed", "Cancelled", "Canceled",
+        "Abandoned", "Void", "P-P", "P - P", "PP", "ABD",
+    ])
+    def test_called_off_markers(self, status):
+        assert is_called_off(status)
+
+    @pytest.mark.parametrize("status", ["", "VS", "P", "A", "3 - 1", "Normal"])
+    def test_live_markers_are_not_called_off(self, status):
+        assert not is_called_off(status)
+
+    def test_parse_fixtures_reads_status_notes_and_a_pp_score(self):
+        html = "<table><tr><td>Home Team</td></tr>" + _FIXTURE_ROW.format(
+            date="27/09/26", time="11:30",
+            home="Attenborough Colts Green U12",
+            away="East Leake Bantams Green U12",
+            score="VS", venue="Chilwell Olympia",
+            division="U12 Sun Winter Div 7 Blue", status="Postponed",
+        ) + _FIXTURE_ROW.format(
+            date="04/10/26", time="10:00",
+            home="Home FC U14", away="Away FC U14",
+            score="P-P", venue="Ground", division="U14 Sunday", status="",
+        ) + "</table>"
+
+        fixtures = parse_fixtures(html)
+
+        assert fixtures[0].status == "Postponed"
+        assert fixtures[0].venue == "Chilwell Olympia"
+        assert fixtures[0].division_label == "U12 Sun Winter Div 7 Blue"
+        assert is_called_off(fixtures[1].status)
+
+
+class TestScheduledFixtures:
+
+    def test_explicit_postponement_is_dropped_even_in_the_future(self):
+        upcoming = _fx("11/10/26", "Home U12", "Away U12", status="Postponed")
+
+        assert scheduled_fixtures([upcoming], [], TODAY, results_available=False) == []
+
+    def test_past_open_age_fixture_with_no_result_is_dropped(self):
+        # The 27 September game is still on the fixtures page; the results
+        # page has other matches but not this one.
+        postponed = _fx(
+            "27/09/26", "Attenborough Colts Green U12", "East Leake Bantams Green U12",
+        )
+        still_to_play = _fx("11/10/26", "Heanor Town Hurricanes U12", "East Leake Bantams Green U12")
+        played = _rs("04/10/26", "East Leake Bantams Green U12", "Stanton U12", 3, 2)
+
+        kept = scheduled_fixtures(
+            [postponed, still_to_play], [played], TODAY, results_available=True,
+        )
+
+        assert kept == [still_to_play]
+
+    def test_a_missing_result_is_not_enough_when_results_were_not_read(self):
+        postponed = _fx("27/09/26", "Home U12", "Away U12")
+
+        kept = scheduled_fixtures([postponed], [], TODAY, results_available=False)
+
+        assert kept == [postponed]
+
+    def test_an_empty_results_page_does_not_wipe_past_fixtures(self):
+        # results_available means the page was reached; an empty list is a
+        # league that has not played, or a parse that found nothing.
+        past = _fx("27/09/26", "Home U12", "Away U12")
+
+        assert scheduled_fixtures([past], [], TODAY, results_available=True) == [past]
+
+    def test_past_restricted_fixture_is_kept_for_participation(self):
+        past = _fx("27/09/26", "Demo FC U10", "Riverside U10", division="U10 Sunday")
+        other = _rs("20/09/26", "Demo FC U14", "Riverside U14", division="U14 Sunday")
+
+        kept = scheduled_fixtures([past], [other], TODAY, results_available=True)
+
+        assert kept == [past]
+
+    def test_restricted_fixture_marked_postponed_is_still_dropped(self):
+        past = _fx(
+            "27/09/26", "Demo FC U10", "Riverside U10",
+            division="U10 Sunday", status="Postponed",
+        )
+
+        assert scheduled_fixtures([past], [], TODAY, results_available=False) == []
+
+
+class TestCalendarKeepsHistory:
+
+    def test_a_result_is_on_the_calendar_with_its_score(self):
+        played = _rs("06/09/26", "East Leake Bantams Green U12", "Borrowash U12", 7, 1)
+        upcoming = _fx("11/10/26", "Heanor Town Hurricanes U12", "East Leake Bantams Green U12")
+
+        ics = fixtures_to_ics("East Leake Bantams Green U12", [upcoming], [played])
+
+        assert ics.count("BEGIN:VEVENT") == 2
+        assert "⚽ East Leake Bantams Green U12 vs Borrowash U12 (Home) 7-1" in ics
+        assert "Result: 7-1" in ics
+        assert "DTSTART;TZID=Europe/London:20260906T100000" in ics
+        assert "DTSTART;TZID=Europe/London:20261011T113000" in ics
+
+    def test_a_result_replaces_the_fixture_for_the_same_match(self):
+        fixture = _fx("06/09/26", "Home U12", "Away U12", time="10:00")
+        result = _rs("06/09/26", "Home U12", "Away U12", 2, 0)
+
+        ics = fixtures_to_ics("Home U12", [fixture], [result])
+
+        assert ics.count("BEGIN:VEVENT") == 1
+        assert "2-0" in ics
+
+    def test_restricted_result_hides_the_score_and_the_opposition(self):
+        result = _rs("06/09/26", "Demo FC U10", "Riverside Rangers U10", 4, 2, "U10 Sunday")
+
+        ics = fixtures_to_ics("Demo FC U10", [], [result])
+
+        assert "SUMMARY:⚽ Demo FC U10 (Home)" in ics
+        assert "Riverside" not in ics
+        assert "4-2" not in ics
+
+    def test_postponed_match_is_absent_and_played_match_remains(self):
+        team = "East Leake Bantams Green U12"
+        postponed = _fx("27/09/26", "Attenborough Colts Green U12", team, status="Postponed")
+        played = _rs("20/09/26", team, "Borrowash Youth Panthers U12", 7, 1)
+        upcoming = _fx("11/10/26", "Heanor Town Hurricanes U12", team)
+
+        ics = team_calendar_ics(
+            team, [postponed, upcoming], [played], today=TODAY,
+        )
+
+        assert "Attenborough" not in ics
+        assert "Borrowash Youth Panthers U12 (Home) 7-1" in ics
+        assert "Heanor Town Hurricanes U12" in ics
+
+    def test_a_refused_results_page_does_not_wipe_history_but_does_drop_postponed(self):
+        team = "East Leake Bantams Green U12"
+        postponed = _fx("27/09/26", "Attenborough Colts Green U12", team, status="Postponed")
+        upcoming = _fx("11/10/26", "Heanor Town Hurricanes U12", team)
+        # Published before status was read, so the postponed game is a normal event.
+        previous = fixtures_to_ics(
+            team,
+            [_fx("27/09/26", "Attenborough Colts Green U12", team), upcoming],
+            [_rs("06/09/26", team, "Eastwood Athletic Blazers U12", 3, 2)],
+        )
+        # The previous file was built before postponements were filtered, so
+        # it still contains the Attenborough event and the played one.
+        assert "Attenborough" in previous
+        assert "Eastwood Athletic Blazers U12" in previous
+
+        ics = team_calendar_ics(
+            team, [postponed, upcoming], [],
+            previous=previous, results_unavailable=True, today=TODAY,
+        )
+
+        assert "Attenborough" not in ics
+        assert "Eastwood Athletic Blazers U12 (Home) 3-2" in ics
+        assert "Heanor Town Hurricanes U12" in ics
+
+    def test_main_publishes_history_and_omits_the_unplayed_fixture(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        monkeypatch.setattr(scrape, "OUTPUT_DIR", tmp_path / "calendars")
+        monkeypatch.setattr(scrape, "LEAGUES", [("111", "League A")])
+        monkeypatch.setattr(scrape, "_results_browser", lambda: None)
+        team = "East Leake Bantams Green U12"
+        today = datetime.now(timezone.utc).date()
+        postponed_on = (today - timedelta(days=9)).strftime("%d/%m/%y")
+        played_on = (today - timedelta(days=30)).strftime("%d/%m/%y")
+        upcoming_on = (today + timedelta(days=21)).strftime("%d/%m/%y")
+        monkeypatch.setattr(
+            scrape, "fetch_fixtures",
+            lambda season, league: [
+                _fx(postponed_on, "Attenborough Colts Green U12", team),
+                _fx(upcoming_on, "Heanor Town Hurricanes U12", team),
+            ],
+        )
+        monkeypatch.setattr(
+            scrape, "fetch_results",
+            lambda season, league, browser=None: [
+                _rs(played_on, team, "Eastwood Athletic Blazers U12", 3, 2),
+            ],
+        )
+
+        assert scrape.main() == 0
+
+        ics = (
+            tmp_path / "calendars" / "league-a" / "east-leake-bantams-green-u12.ics"
+        ).read_text(encoding="utf-8")
+        feed = json.loads(
+            (tmp_path / "feeds" / "league-a" / "teams" / "east-leake-bantams-green-u12.json")
+            .read_text(encoding="utf-8")
+        )
+
+        assert "Attenborough" not in ics
+        assert "Eastwood Athletic Blazers U12 (Home) 3-2" in ics
+        assert "Heanor Town Hurricanes U12" in ics
+        assert feed["results"][0]["opponent"] == "Eastwood Athletic Blazers U12"
+        assert all("Attenborough" not in row["opponent"] for row in feed["fixtures"])
+        assert any(row["opponent"] == "Heanor Town Hurricanes U12" for row in feed["fixtures"])
+

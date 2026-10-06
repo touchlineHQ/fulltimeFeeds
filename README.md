@@ -14,6 +14,10 @@ Updated daily by a local cron job.
 3. In Google Calendar: **+ Other calendars → From URL** → paste the URL
 
 The calendar will auto-refresh (Google typically polls every 12–24 hours).
+Played matches stay on it after they leave Full-Time's fixtures page, with the
+score in the title where one may be published. A postponed, cancelled or
+abandoned match is left off — including one Full-Time is still listing after
+its date with no result.
 
 > **Tip:** The calendar URL looks like:
 > `https://fixtures.touchlinehq.co.uk/calendars/yel-east-midlands-sunday-25-26/eastwood-athletic-atalanta-u10.ics`
@@ -113,7 +117,14 @@ place:
 - **A match that has a result is not also a fixture.** Full-Time keeps a played
   match on its fixtures page while the league enters the score, and after that
   in some competitions. Once the score is published the match appears in
-  `results` only.
+  `results` only. It stays on the team calendar either way.
+- **A postponed match is left out.** Full-Time also keeps postponed, cancelled
+  and abandoned games on the fixtures page, often with no status filled in.
+  Those are not published: a status that says the game was called off is
+  enough, and so is a past open-age fixture with no result once the results
+  page has been read. U11 and below are the exception to the second test,
+  because those scores are not published — a past restricted fixture is
+  treated as played, unless it is explicitly called off.
 - **A club derby is listed once.** When both teams belong to the same club, the
   match is scraped for each side; the club feed keeps the home side's row —
   which already names both teams the right way round — and marks it
