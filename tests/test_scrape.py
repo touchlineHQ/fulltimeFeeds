@@ -839,25 +839,6 @@ class TestFetchResults:
 
         assert len(scrape.fetch_results("123", "League A")) == 1
 
-    def test_no_date_url_returns_results_after_whole_season_fetch_raises(self, monkeypatch):
-        seen = []
-        result = self._result()
-
-        def fetch(url, label):
-            seen.append(url)
-            if "selectedDateCode=all" in url:
-                raise RuntimeError("HTTP Error 403")
-            return "<html>rows</html>"
-
-        monkeypatch.setattr(scrape, "_fetch_page", fetch)
-        monkeypatch.setattr(scrape, "parse_results", lambda html: [result] if html else [])
-        monkeypatch.setattr(scrape, "_fetch_page_js", lambda url, label: "")
-        monkeypatch.setattr(scrape, "_saved_results_page", lambda season: None)
-
-        assert scrape.fetch_results("123", "League A") == [result]
-        assert seen == [scrape._results_url("123"), scrape._results_url("123", date_code="")]
-        assert scrape.LAST_SOURCE == "a plain fetch"
-
     def test_refused_fetch_raises_results_unavailable(self, monkeypatch):
         def blocked(url, label):
             raise RuntimeError("HTTP Error 403")
@@ -1601,7 +1582,7 @@ class TestCalledOffStatus:
         assert scored["East Leake Bantams Green U12"] == (3, 2)
         assert scored["East Leake Bantams U10"] == (None, None)
 
-    def test_results_are_asked_for_the_whole_season_first(self, monkeypatch):
+    def test_results_use_the_url_the_cron_was_already_fetching(self, monkeypatch):
         seen = []
 
         def fetch(url, label):
@@ -1615,10 +1596,30 @@ class TestCalledOffStatus:
         )
 
         assert len(scrape.fetch_results("876713597", "YEL Sunday", browser=None)) == 1
-        assert seen[0].startswith("https://fulltime.thefa.com/results/")
-        assert "selectedDateCode=all" in seen[0]
-        assert "selectedSeason=876713597" in seen[0]
-        assert len(seen) == 1
+        assert seen == [
+            "https://fulltime.thefa.com/results/1/100000.html"
+            "?selectedSeason=876713597&selectedFixtureGroupKey="
+        ]
+
+    def test_a_challenge_is_retried_in_the_browser_on_that_same_url(self, monkeypatch):
+        # selectedDateCode=all is a different request and is refused. The
+        # browser has to be handed the URL the plain fetch just tried.
+        monkeypatch.setattr(
+            scrape, "_fetch_page",
+            lambda url, label: "<html><title>Just a moment...</title></html>",
+        )
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: [scrape.Result("04/10/26", "15:00", "A", "B", 1, 0, "", "D")]
+            if "home-team" in html else [],
+        )
+        browser = _FakeBrowser(html="<html><td class='home-team'>A</td></html>")
+
+        assert len(scrape.fetch_results("876713597", "YEL Sunday", browser=browser)) == 1
+        assert browser.calls == [
+            "https://fulltime.thefa.com/results/1/100000.html"
+            "?selectedSeason=876713597&selectedFixtureGroupKey="
+        ]
 
 
 class TestScheduledFixtures:
