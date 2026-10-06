@@ -432,26 +432,23 @@ def fetch_results(
             log.warning(f"  {league_name}: no results via {detail}")
         return None
 
-    static_failed = False
     try:
         html = _fetch_page(_results_url(season_id), label)
     except Exception as e:
         refusal = str(e)
-        static_failed = True
         html = ""
     found = consider(html, "a plain fetch", "the whole-season URL")
     if found is not None:
         return found
 
-    if not static_failed:
-        try:
-            html = _fetch_page(_results_url(season_id, date_code=""), label)
-        except Exception as e:
-            refusal = refusal or str(e)
-            html = ""
-        found = consider(html, "a plain fetch", "no date filter")
-        if found is not None:
-            return found
+    try:
+        html = _fetch_page(_results_url(season_id, date_code=""), label)
+    except Exception as e:
+        refusal = refusal or str(e)
+        html = ""
+    found = consider(html, "a plain fetch", "no date filter")
+    if found is not None:
+        return found
 
     if saw_real_page:
         LAST_SOURCE = "a plain fetch"
@@ -2191,7 +2188,7 @@ def _run(browser_holder: list) -> int:
         # is not published — played matches come back from the results page
         # instead, which is what keeps them on the calendar. The flag is
         # league-wide: a team with no result of its own is still unplayed.
-        league_has_results = bool(results) and not results_unavailable
+        league_has_results = bool(results) and not results_unavailable and not results_failed
         fixtures = scheduled_fixtures(
             raw_fixtures,
             results,

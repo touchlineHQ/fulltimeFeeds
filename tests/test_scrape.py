@@ -839,6 +839,25 @@ class TestFetchResults:
 
         assert len(scrape.fetch_results("123", "League A")) == 1
 
+    def test_no_date_url_returns_results_after_whole_season_fetch_raises(self, monkeypatch):
+        seen = []
+        result = self._result()
+
+        def fetch(url, label):
+            seen.append(url)
+            if "selectedDateCode=all" in url:
+                raise RuntimeError("HTTP Error 403")
+            return "<html>rows</html>"
+
+        monkeypatch.setattr(scrape, "_fetch_page", fetch)
+        monkeypatch.setattr(scrape, "parse_results", lambda html: [result] if html else [])
+        monkeypatch.setattr(scrape, "_fetch_page_js", lambda url, label: "")
+        monkeypatch.setattr(scrape, "_saved_results_page", lambda season: None)
+
+        assert scrape.fetch_results("123", "League A") == [result]
+        assert seen == [scrape._results_url("123"), scrape._results_url("123", date_code="")]
+        assert scrape.LAST_SOURCE == "a plain fetch"
+
     def test_refused_fetch_raises_results_unavailable(self, monkeypatch):
         def blocked(url, label):
             raise RuntimeError("HTTP Error 403")
@@ -1603,6 +1622,43 @@ class TestCalledOffStatus:
 
 
 class TestScheduledFixtures:
+
+    @pytest.mark.parametrize("error_type", [RuntimeError, scrape.ResultsUnavailable])
+    @pytest.mark.parametrize("result_source", ["published", "fixtures"])
+    def test_failed_results_fetch_keeps_past_fixture_with_other_scores(
+        self, tmp_path, monkeypatch, error_type, result_source,
+    ):
+        feeds = tmp_path / "feeds"
+        monkeypatch.setattr(scrape, "FEEDS_DIR", feeds)
+        monkeypatch.setattr(scrape, "OUTPUT_DIR", tmp_path / "calendars")
+        monkeypatch.setattr(scrape, "LEAGUES", [("111", "League A")])
+        monkeypatch.setattr(scrape, "_results_browser", lambda: None)
+        today = datetime.now(timezone.utc).date()
+        past_on = (today - timedelta(days=9)).strftime("%d/%m/%y")
+        played_on = (today - timedelta(days=30)).strftime("%d/%m/%y")
+        past = _fx(past_on, "Home U12", "Away U12")
+        result = _rs(played_on, "Home U12", "Other U12")
+        if result_source == "published":
+            scrape.write_team_feed(
+                "Home U12", "home-u12", "League A", "league-a", [], [result],
+                "2026-10-05T06:00:00Z",
+            )
+        monkeypatch.setattr(
+            scrape, "fetch_fixtures",
+            lambda season, league: ([past], [result] if result_source == "fixtures" else []),
+        )
+
+        def failed(season, league, browser=None):
+            raise error_type("results fetch failed")
+
+        monkeypatch.setattr(scrape, "fetch_results", failed)
+
+        assert scrape.main() == 0
+        fixtures = json.loads((feeds / "league-a" / "fixtures.json").read_text())
+        results = json.loads((feeds / "league-a" / "results.json").read_text())
+        assert [row["away_team"] for row in fixtures["fixtures"]] == ["Away U12"]
+        assert [row["away_team"] for row in results["results"]] == ["Other U12"]
+        assert results["results_unavailable"] is True
 
     def test_explicit_postponement_is_dropped_even_in_the_future(self):
         upcoming = _fx("11/10/26", "Home U12", "Away U12", status="Postponed")
