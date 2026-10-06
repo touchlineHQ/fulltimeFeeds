@@ -1558,6 +1558,49 @@ class TestCalledOffStatus:
         assert fixtures[0].division_label == "U12 Sun Winter Div 7 Blue"
         assert is_called_off(fixtures[1].status)
 
+    def test_a_score_on_the_fixtures_page_is_a_result(self):
+        html = "<table><tr><td>Home Team</td></tr>" + _FIXTURE_ROW.format(
+            date="04/10/26", time="11:15",
+            home="East Leake Bantams Green U12",
+            away="Stanton Ilkeston Scorpions U12",
+            score="3 - 2", venue="Costock Road",
+            division="U12 Sun", status="",
+        ) + _FIXTURE_ROW.format(
+            date="03/10/26", time="10:00",
+            home="East Leake Bantams U10", away="Opposition U10",
+            score="X - X", venue="Home", division="U10", status="",
+        ) + _FIXTURE_ROW.format(
+            date="11/10/26", time="10:00",
+            home="East Leake Robins", away="AJ Sport",
+            score="VS", venue="Costock", division="Premier", status="",
+        ) + "</table>"
+
+        fixtures, played = scrape.parse_fixture_page(html)
+
+        assert [f.home_team for f in fixtures] == ["East Leake Robins"]
+        scored = {row.home_team: (row.home_score, row.away_score) for row in played}
+        assert scored["East Leake Bantams Green U12"] == (3, 2)
+        assert scored["East Leake Bantams U10"] == (None, None)
+
+    def test_results_are_asked_for_the_whole_season_first(self, monkeypatch):
+        seen = []
+
+        def fetch(url, label):
+            seen.append(url)
+            return "<html><td class='home-team'>A</td></html>"
+
+        monkeypatch.setattr(scrape, "_fetch_page", fetch)
+        monkeypatch.setattr(
+            scrape, "parse_results",
+            lambda html: [scrape.Result("04/10/26", "15:00", "East Leake Robins", "AJ Sport", 8, 1, "", "Premier")],
+        )
+
+        assert len(scrape.fetch_results("876713597", "YEL Sunday", browser=None)) == 1
+        assert seen[0].startswith("https://fulltime.thefa.com/results/")
+        assert "selectedDateCode=all" in seen[0]
+        assert "selectedSeason=876713597" in seen[0]
+        assert len(seen) == 1
+
 
 class TestScheduledFixtures:
 

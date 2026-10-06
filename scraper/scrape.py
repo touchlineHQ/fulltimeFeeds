@@ -211,11 +211,40 @@ def _fetch_page(url: str, label: str) -> str:
     raise last_err  # type: ignore[misc]
 
 
-def fetch_fixtures(season_id: str, league_name: str) -> list[Fixture]:
-    """Fetch all upcoming fixtures for a given season/league."""
+def fetch_fixtures(season_id: str, league_name: str) -> tuple[list[Fixture], list[Result]]:
+    """Fetch a season's fixture list, split into (still to come, already played).
+
+    Full-Time leaves a played match on the fixture list until the league enters
+    the result, and at U11 and below some leagues never do. The score cell
+    still says ``3 - 1`` or ``X - X``, so those rows come back as results
+    rather than as matches still to be played.
+    """
     url = f"{FIXTURES_URL}?selectedSeason={season_id}&selectedFixtureGroupKey="
     log.info(f"Fetching fixtures for {league_name} ...")
-    return parse_fixtures(_fetch_page(url, f"fixtures/{league_name}"))
+    fixtures, played = parse_fixture_page(_fetch_page(url, f"fixtures/{league_name}"))
+    log.info(f"  Found {len(fixtures)} fixtures ({len(played)} already played)")
+    return fixtures, played
+
+
+def _results_url(season_id: str, date_code: str = "all") -> str:
+    """Full-Time's results page for a whole season.
+
+    Asked for without ``selectedDateCode`` the results page answers for one
+    period only — often one with no matches in it — which is how a season
+    full of played matches comes back empty. ``all`` asks for the season.
+    This is the request the working cron was making.
+    """
+    params = [f"selectedSeason={season_id}"]
+    if date_code:
+        params.append(f"selectedDateCode={date_code}")
+    params += [
+        "selectedFixtureGroupAgeGroupId=",
+        "selectedFixtureGroupKey=",
+        "selectedRelation=",
+        "selectedClub=",
+        "selectedTeam=",
+    ]
+    return f"{RESULTS_URL}?" + "&".join(params)
 
 
 def _fetch_page_js(url: str, label: str) -> str:
@@ -370,43 +399,67 @@ def fetch_results(
     league_name: str,
     browser: BrowserSession | None = None,
 ) -> list[Result]:
-    """Fetch all results for a given season/league.
+    """Fetch a season's results, trying each way the page will give them up.
 
-    The plain fetch is tried first: it is cheap, and it succeeds outright
-    whenever the client is not being challenged — with FULLTIME_COOKIE set, for
-    instance.  Only when it is refused does *browser* get used, which is why the
-    session is started lazily; a run that never needs it never launches one.
-
-    Raises ResultsUnavailable when both are refused, so an empty results array
-    can be published as "withheld from us" rather than "nobody played".
+    Cheapest first: the whole-season URL (``selectedDateCode=all``), then the
+    same page with no date filter, then the browser session, then the
+    Playwright render the working cron used, then a page saved from a browser.
+    A page with rows is the answer, even if it also carries a challenge
+    script. A genuine page with no rows is a league that has not played, and
+    is not a refusal. Only when every route was blocked is ResultsUnavailable
+    raised.
     """
     global LAST_SOURCE
     LAST_SOURCE = ""
-    url = f"{RESULTS_URL}?selectedSeason={season_id}&selectedFixtureGroupKey="
     label = f"results/{league_name}"
     log.info(f"Fetching results for {league_name} ...")
-
     refusal = ""
+    saw_real_page = False
+
+    def consider(html: str, source: str, detail: str) -> list[Result] | None:
+        nonlocal saw_real_page
+        global LAST_SOURCE
+        if not html:
+            return None
+        log.debug(f"  {detail}: {len(html)} bytes, {html.count('<table')} tables")
+        found = parse_results(html)
+        if found:
+            LAST_SOURCE = source
+            log.info(f"  {league_name}: {len(found)} result(s) via {detail}")
+            return found
+        if not is_challenge_page(html):
+            saw_real_page = True
+            log.warning(f"  {league_name}: no results via {detail}")
+        return None
+
+    static_failed = False
     try:
-        html = _fetch_page(url, label)
+        html = _fetch_page(_results_url(season_id), label)
     except Exception as e:
         refusal = str(e)
+        static_failed = True
         html = ""
+    found = consider(html, "a plain fetch", "the whole-season URL")
+    if found is not None:
+        return found
 
-    if html:
-        log.debug(f"Results HTML length: {len(html)}, tables: {html.count('<table')}")
-        results = parse_results(html)
-        # Rows decide, not the markers: Cloudflare's scripts appear on ordinary
-        # pages too, and treating a page that parsed as an interstitial would
-        # throw away results we had already been given.
-        if results or not is_challenge_page(html):
-            # A page that answers with no rows is a league that has not played
-            # yet, which is not the same as one we were refused.
-            LAST_SOURCE = "a plain fetch"
-            return results
+    if not static_failed:
+        try:
+            html = _fetch_page(_results_url(season_id, date_code=""), label)
+        except Exception as e:
+            refusal = refusal or str(e)
+            html = ""
+        found = consider(html, "a plain fetch", "no date filter")
+        if found is not None:
+            return found
+
+    if saw_real_page:
+        LAST_SOURCE = "a plain fetch"
+        return []
 
     if browser is not None:
         log.info(f"  {label}: refused a plain fetch — retrying through the browser")
+        url = _results_url(season_id)
         try:
             rendered = browser.fetch(url, wait_selector="td.home-team")
         except BrowserUnavailable as e:
@@ -415,32 +468,53 @@ def fetch_results(
         except Exception as e:
             log.warning(f"  {label}: browser fetch failed ({e})")
             rendered = ""
+        found = consider(rendered, "the browser", "the browser")
+        if found is not None:
+            return found
+        if saw_real_page:
+            LAST_SOURCE = "the browser"
+            return []
 
-        if rendered:
-            results = parse_results(rendered)
-            if results or not is_challenge_page(rendered):
-                log.info(f"  {label}: {len(results)} result(s) via the browser")
-                LAST_SOURCE = "the browser"
-                return results
+    rendered = _fetch_page_js(_results_url(season_id), label)
+    found = consider(rendered, "a browser render", "a browser render")
+    if found is not None:
+        return found
+    if saw_real_page:
+        LAST_SOURCE = "a browser render"
+        return []
 
-    # Last resort, and the one that does not depend on winning an argument with
-    # a WAF: a page someone loaded in a browser and saved.
     saved = _saved_results_page(season_id)
     if saved:
         saved_html, age_days = saved
-        results = parse_results(saved_html)
-        LAST_SOURCE = f"a saved page ({age_days:.1f} days old)"
-        log.info(f"  {label}: {len(results)} result(s) from a page saved "
-                 f"{age_days:.1f} day(s) ago")
-        if age_days > 7:
-            log.warning(f"  {label}: that saved page is {age_days:.0f} days old — "
-                        f"save a fresh one to pick up recent results")
-        return results
+        found = consider(saved_html, f"a saved page ({age_days:.1f} days old)", "a saved page")
+        if found is not None:
+            if age_days > 7:
+                log.warning(
+                    f"  {label}: that saved page is {age_days:.0f} days old — "
+                    f"save a fresh one to pick up recent results"
+                )
+            return found
+        if saw_real_page:
+            LAST_SOURCE = f"a saved page ({age_days:.1f} days old)"
+            return []
 
     raise ResultsUnavailable(
         f"{league_name}: results page refused ({refusal or 'challenge page'}), "
         f"no browser got through, and no saved page was found"
     )
+
+
+def merge_results(primary: list[Result], extra: list[Result]) -> list[Result]:
+    """Keep one row per match. Rows in ``primary`` win; ``extra`` only fills gaps."""
+    merged = list(primary)
+    seen = {(row.date, row.home_team, row.away_team) for row in merged}
+    for result in extra:
+        key = (result.date, result.home_team, result.away_team)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(result)
+    return merged
 
 
 def _find_fixture_table(soup: BeautifulSoup, context: str) -> object | None:
@@ -465,26 +539,25 @@ def _find_fixture_table(soup: BeautifulSoup, context: str) -> object | None:
 
 
 def parse_fixtures(html: str) -> list[Fixture]:
-    """Parse the Full-Time fixtures table using CSS classes.
+    """Parse the fixtures table, returning matches still to be played."""
+    fixtures, _played = parse_fixture_page(html)
+    return fixtures
 
-    Each data row has 10 cells:
-      [0] type          (class: color-dark-grey bold cell-divider)
-      [1] date+time     (class: left cell-divider) — e.g. "22/03/2610:00"
-      [2] home team     (class: home-team)
-      [3] home logo     (class: team-logo) — empty text
-      [4] VS / score    (class: score)
-      [5] away logo     (class: team-logo) — empty text
-      [6] away team     (class: road-team)
-      [7] venue         (class: left cell-divider)
-      [8] competition   (class: left cell-divider)
-      [9] status        (class: status-notes)
+
+def parse_fixture_page(html: str) -> tuple[list[Fixture], list[Result]]:
+    """Split the fixtures table into matches still to come and ones already scored.
+
+    ``VS`` is still to be played. A score (``3 - 1``, or ``X - X`` where it is
+    withheld) has been played. ``P-P`` and a status note are called off and
+    stay fixtures so they can be left out.
     """
     soup = BeautifulSoup(html, "html.parser")
     fixtures: list[Fixture] = []
+    played: list[Result] = []
 
     fixture_table = _find_fixture_table(soup, "fixtures")
     if not fixture_table:
-        return []
+        return [], []
 
     # Parse data rows (skip header)
     for row in fixture_table.find_all("tr")[1:]:
@@ -537,23 +610,53 @@ def parse_fixtures(html: str) -> list[Fixture]:
         if not is_called_off(status) and is_called_off(score_text):
             status = score_text
 
-        if date_str:
-            fixtures.append(Fixture(
+        if not date_str:
+            continue
+
+        score = None
+        if not is_called_off(status):
+            score = _read_score(score_text)
+        if score is not None:
+            played.append(Result(
                 date=date_str,
                 time=time_str,
                 home_team=home,
                 away_team=away,
+                home_score=score[0],
+                away_score=score[1],
                 venue=venue,
                 division_label=competition or "Unknown Division",
-                status=status,
             ))
+            continue
 
-    log.info(f"  Found {len(fixtures)} fixtures")
-    return fixtures
+        fixtures.append(Fixture(
+            date=date_str,
+            time=time_str,
+            home_team=home,
+            away_team=away,
+            venue=venue,
+            division_label=competition or "Unknown Division",
+            status=status,
+        ))
+
+    log.info(f"  Found {len(fixtures)} fixtures ({len(played)} already played)")
+    return fixtures, played
 
 
 _REDACTED_SCORE_RE = re.compile(r"\bX\s*[-–—]\s*X\b", re.IGNORECASE)
 _SCORE_RE = re.compile(r"(?<![0-9-])(\d{1,2})\s*[-–—]\s*(\d{1,2})(?![0-9])")
+
+
+def _read_score(text: str) -> tuple[int | None, int | None] | None:
+    """Read a score cell. ``3 - 1`` is a result, ``X - X`` is a withheld one, ``VS`` is neither."""
+    if not text:
+        return None
+    if _REDACTED_SCORE_RE.search(text):
+        return (None, None)
+    match = _SCORE_RE.search(text)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    return None
 
 
 def _parse_score(row) -> tuple[int | None, int | None] | None:
@@ -2009,10 +2112,14 @@ def _run(browser_holder: list) -> int:
 
     for season_id, league_name in LEAGUES:
         try:
-            fixtures = fetch_fixtures(season_id, league_name)
+            fetched = fetch_fixtures(season_id, league_name)
         except Exception as e:
             log.error(f"Failed to fetch fixtures for {league_name}: {e}")
-            fixtures = []
+            fetched = []
+        if isinstance(fetched, tuple):
+            fixtures, played_on_fixtures = fetched
+        else:
+            fixtures, played_on_fixtures = fetched, []
 
         results_unavailable = False
         results_failed = False
@@ -2037,6 +2144,8 @@ def _run(browser_holder: list) -> int:
             results_failed = True
             results_report.append((league_name, f"FAILED — {e}"))
 
+        results = merge_results(results, played_on_fixtures)
+
         if not fixtures and not results:
             log.warning(f"No fresh data found for {league_name}")
             league_slug_name = slug(league_name)
@@ -2049,7 +2158,7 @@ def _run(browser_holder: list) -> int:
         # replace last week's scores with an empty array, which is what made a
         # club's weekend look like it never happened. Keep what was published.
         retained_participation: dict[str, list[dict]] = {}
-        if (results_unavailable or results_failed) and not results:
+        if results_unavailable or results_failed:
             retained, retained_participation = load_published_history(slug(league_name))
             kept_records = sum(len(rows) for rows in retained_participation.values())
             if retained or kept_records:
@@ -2058,7 +2167,7 @@ def _run(browser_holder: list) -> int:
                     f"{len(retained)} previously published result(s) and "
                     f"{kept_records} participation record(s)"
                 )
-                results = retained
+                results = merge_results(results, retained)
                 note = (
                     f"kept {len(retained)} published result(s), "
                     f"{kept_records} participation record(s)"
