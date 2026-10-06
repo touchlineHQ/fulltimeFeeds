@@ -149,6 +149,7 @@ class Fixture(NamedTuple):
     away_team: str
     venue: str         # home team's ground, if listed
     division_label: str
+    status: str = ""   # Full-Time status notes, e.g. "Postponed" or ""
 
 
 class Result(NamedTuple):
@@ -325,6 +326,28 @@ def _saved_results_page(season_id: str) -> tuple[str, float] | None:
     return best
 
 
+_CALLED_OFF_RE = re.compile(
+    r"(?i)(?:"
+    r"\b(?:postponed|postponement|cancelled|canceled|abandoned|void(?:ed)?|called[\s-]?off)\b"
+    r"|^(?:p[\s.\-]*p|pp|abd|canc)$"
+    r")"
+)
+
+
+def is_called_off(status: str) -> bool:
+    """True when Full-Time has marked a match postponed, cancelled or abandoned.
+
+    The public fixtures table puts that in the status notes, or sometimes in
+    the score cell as ``P-P`` instead of ``VS``. A bare ``P`` is not enough:
+    it is used for other things and would drop live matches.
+    """
+    return bool(status and _CALLED_OFF_RE.search(status.strip()))
+
+
+def _match_id(date: str, home: str, away: str) -> str:
+    return hashlib.md5(f"{date}|{home}|{away}".encode()).hexdigest()
+
+
 class ResultsUnavailable(Exception):
     """Full-Time refused the results page.
 
@@ -490,12 +513,15 @@ def parse_fixtures(html: str) -> list[Fixture]:
                     time_str = tm.group(1)
                 break
 
-        # Venue and competition: cells after the away team
+        # Venue, competition, and the status notes Full-Time uses for
+        # "Postponed" / "Abandoned" / "Cancelled". Status is the last cell.
         venue = ""
         competition = ""
+        status = ""
         for td in away_td.find_next_siblings("td"):
             classes = td.get("class", [])
-            if "status-notes" in classes:
+            if any("status" in c for c in classes):
+                status = td.get_text(strip=True)
                 break
             text = td.get_text(strip=True)
             if not text:
@@ -505,6 +531,12 @@ def parse_fixtures(html: str) -> list[Fixture]:
             elif not competition:
                 competition = text
 
+        # Some leagues put P-P in the score cell and leave status blank.
+        score_td = row.find("td", class_=re.compile(r"\bscore\b"))
+        score_text = score_td.get_text(strip=True) if score_td else ""
+        if not is_called_off(status) and is_called_off(score_text):
+            status = score_text
+
         if date_str:
             fixtures.append(Fixture(
                 date=date_str,
@@ -513,6 +545,7 @@ def parse_fixtures(html: str) -> list[Fixture]:
                 away_team=away,
                 venue=venue,
                 division_label=competition or "Unknown Division",
+                status=status,
             ))
 
     log.info(f"  Found {len(fixtures)} fixtures")
@@ -816,22 +849,17 @@ def parse_dt(date_str: str, time_str: str) -> datetime | None:
         return d.replace(hour=10, minute=0)
 
 
-def make_uid(fixture: Fixture) -> str:
-    key = f"{fixture.date}|{fixture.home_team}|{fixture.away_team}"
-    return hashlib.md5(key.encode()).hexdigest() + "@yel-calendar"
+def make_uid(match) -> str:
+    return _match_id(match.date, match.home_team, match.away_team) + "@yel-calendar"
 
 
-def make_restricted_uid(
-    fixture: Fixture,
-    team_name: str,
-    home_away: str,
-) -> str:
+def make_restricted_uid(match, team_name: str, home_away: str) -> str:
     """Build a calendar UID without using the restricted opposition name."""
     public_event = {
-        "date": fixture.date,
-        "time": fixture.time or "10:00",
+        "date": match.date,
+        "time": match.time or "10:00",
         "home_away": home_away.lower(),
-        "division": fixture.division_label,
+        "division": match.division_label,
     }
     return (
         restricted_record_id(public_event, team_name, "calendar")
@@ -839,43 +867,61 @@ def make_restricted_uid(
     )
 
 
-def fixtures_to_ics(team_name: str, fixtures: list[Fixture]) -> str:
+def fixtures_to_ics(
+    team_name: str,
+    fixtures: list[Fixture],
+    results: list[Result] | None = None,
+) -> str:
+    """One calendar of what is still to play and what has already been played.
+
+    Results are included so a match stays on the calendar after Full-Time takes
+    it off the fixtures page. A result and a fixture for the same match become
+    one event — the result, which carries the score. Called-off fixtures are
+    omitted; they are not history.
+    """
+    results = list(results or [])
+    played = {_match_id(r.date, r.home_team, r.away_team) for r in results}
     dtstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    lines = [VCALENDAR_HEADER.format(cal_name=team_name)]
+    events: list[tuple[datetime, str, str]] = []
 
-    for f in fixtures:
-        dt_start = parse_dt(f.date, f.time)
+    def add(match, score: str) -> None:
+        dt_start = parse_dt(match.date, match.time)
         if not dt_start:
-            continue
-        dt_end = dt_start + timedelta(minutes=60)  # assume 60min slot
-        is_home = f.home_team == team_name
-        opponent = f.away_team if is_home else f.home_team
+            return
+        dt_end = dt_start + timedelta(minutes=60)
+        is_home = match.home_team == team_name
+        if match.home_team != team_name and match.away_team != team_name:
+            return
+        opponent = match.away_team if is_home else match.home_team
         home_away = "Home" if is_home else "Away"
-
         # Calendars are published on public URLs like everything else, so a
         # U11-or-below event carries only the club's own team, the kick-off and
-        # whether it is home or away — no opposition, no venue.
+        # whether it is home or away — no opposition, no venue, no score.
         restricted = is_restricted(
-            team_name, f.home_team, f.away_team, f.division_label
+            team_name, match.home_team, match.away_team, match.division_label
         )
         if restricted:
-            uid = make_restricted_uid(f, team_name, home_away)
+            uid = make_restricted_uid(match, team_name, home_away)
             summary = f"{'⚽'} {team_name} ({home_away})"
             description = (
-                f"Division: {f.division_label}\\n"
-                f"KO: {f.time or 'TBC'}\\n"
+                f"Division: {match.division_label}\\n"
+                f"KO: {match.time or 'TBC'}\\n"
                 f"Opposition and venue are not published at U11 and below."
             )
             location = ""
         else:
-            uid = make_uid(f)
+            uid = make_uid(match)
             summary = f"{'⚽'} {team_name} vs {opponent} ({home_away})"
+            if score:
+                summary = f"{summary} {score}"
             description = (
-                f"Division: {f.division_label}\\n"
-                f"{f.home_team} v {f.away_team}\\n"
-                f"KO: {f.time or 'TBC'}"
+                f"Division: {match.division_label}\\n"
+                f"{match.home_team} v {match.away_team}\\n"
+                f"KO: {match.time or 'TBC'}"
             )
-            location = f.venue or ""
+            if score:
+                description += f"\\nResult: {score}"
+            location = match.venue or ""
 
         event = VEVENT_TEMPLATE.format(
             uid=uid,
@@ -886,8 +932,30 @@ def fixtures_to_ics(team_name: str, fixtures: list[Fixture]) -> str:
             description=description,
             location=location,
         )
-        lines.append(event)
+        events.append((dt_start, uid, event))
 
+    for fixture in fixtures:
+        if is_called_off(fixture.status):
+            continue
+        if _match_id(fixture.date, fixture.home_team, fixture.away_team) in played:
+            continue
+        add(fixture, "")
+
+    for result in results:
+        score = ""
+        if (
+            result.home_score is not None
+            and result.away_score is not None
+            and not is_restricted(
+                team_name, result.home_team, result.away_team, result.division_label
+            )
+        ):
+            score = f"{result.home_score}-{result.away_score}"
+        add(result, score)
+
+    events.sort(key=lambda item: (item[0], item[1]))
+    lines = [VCALENDAR_HEADER.format(cal_name=team_name)]
+    lines.extend(event for _, _, event in events)
     lines.append(VCALENDAR_FOOTER)
     return "".join(lines)
 
@@ -909,7 +977,7 @@ def fixture_to_iso_date(date_str: str) -> str:
 def fixture_to_dict(fixture: Fixture) -> dict:
     """Serialise a Fixture to a plain dict for JSON output."""
     return {
-        "id": hashlib.md5(f"{fixture.date}|{fixture.home_team}|{fixture.away_team}".encode()).hexdigest(),
+        "id": _match_id(fixture.date, fixture.home_team, fixture.away_team),
         "date": fixture_to_iso_date(fixture.date),
         "time": fixture.time or "10:00",
         "home_team": fixture.home_team,
@@ -922,7 +990,7 @@ def fixture_to_dict(fixture: Fixture) -> dict:
 def result_to_dict(result: Result) -> dict:
     """Serialise a Result to a plain dict for JSON output."""
     return {
-        "id": hashlib.md5(f"{result.date}|{result.home_team}|{result.away_team}".encode()).hexdigest(),
+        "id": _match_id(result.date, result.home_team, result.away_team),
         "date": fixture_to_iso_date(result.date),
         "time": result.time or "10:00",
         "home_team": result.home_team,
@@ -976,6 +1044,144 @@ def drop_settled_fixtures(
     """
     played = {row["id"] for row in result_rows if row.get("id")}
     return [row for row in fixture_rows if row.get("id") not in played]
+
+
+def scheduled_fixtures(
+    fixtures: list[Fixture],
+    results: list[Result],
+    today: str,
+    *,
+    results_available: bool,
+) -> list[Fixture]:
+    """Fixtures that are still to be played.
+
+    Full-Time leaves a postponed match on the fixtures page, with no score, for
+    the rest of the season — East Leake Bantams Green U12 v Attenborough on
+    27 September is still there weeks later, while every match that was
+    actually played has moved to the results page.  Drop a fixture when its
+    status says it was called off.  Once a real results listing is in hand,
+    also drop an open-age fixture whose date has passed and which has no
+    result: that is the same situation with the status cell left blank.
+
+    Restricted (U11 and below) fixtures are not dropped for a missing result.
+    Those leagues often never publish a score, and a past one is a played
+    match recorded as participation, not a postponement.  An explicit
+    called-off status still removes them.
+    """
+    played = {_match_id(r.date, r.home_team, r.away_team) for r in results}
+    # ``results`` may be a single team's rows. ``results_available`` is set by
+    # the caller only when the league's results page had rows, so a team with
+    # nothing of its own is still judged against the league. An empty page, or
+    # a page that could not be read, must be passed as results_available=False
+    # — otherwise every past open-age fixture would look postponed.
+    know_unplayed = results_available
+    kept: list[Fixture] = []
+    for fixture in fixtures:
+        if is_called_off(fixture.status):
+            continue
+        iso = fixture_to_iso_date(fixture.date)
+        unplayed = (
+            know_unplayed
+            and bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", iso))
+            and iso < today
+            and _match_id(fixture.date, fixture.home_team, fixture.away_team) not in played
+            and not is_restricted(
+                fixture.home_team, fixture.away_team, fixture.division_label
+            )
+        )
+        if unplayed:
+            continue
+        kept.append(fixture)
+    return kept
+
+
+_VEVENT_RE = re.compile(r"BEGIN:VEVENT\r?\n.*?END:VEVENT\r?\n?", re.DOTALL)
+_DTSTART_RE = re.compile(r"DTSTART(?:;[^:\r\n]+)?:(\d{8})")
+_UID_RE = re.compile(r"^UID:(.+)$", re.MULTILINE)
+
+
+def calendar_uid(match, team_name: str) -> str:
+    """The UID fixtures_to_ics would publish for this match on this team's calendar."""
+    is_home = match.home_team == team_name
+    home_away = "Home" if is_home else "Away"
+    if is_restricted(team_name, match.home_team, match.away_team, match.division_label):
+        return make_restricted_uid(match, team_name, home_away)
+    return make_uid(match)
+
+
+def retain_past_events(
+    ics: str,
+    previous: str,
+    today: str,
+    blocked_uids: set[str],
+) -> str:
+    """Keep past events from the last calendar when this run has no results.
+
+    A refused results page must not wipe a season that was already published.
+    Events for matches now known to be called off are in ``blocked_uids`` and
+    are not kept. Future events are not kept either: if Full-Time no longer
+    lists them, they were rearranged.
+    """
+    if not previous:
+        return ics
+    current = set(_UID_RE.findall(ics))
+    kept: list[str] = []
+    for block in _VEVENT_RE.findall(previous):
+        uid_m = _UID_RE.search(block)
+        start_m = _DTSTART_RE.search(block)
+        if not uid_m or not start_m:
+            continue
+        uid = uid_m.group(1).strip()
+        if uid in current or uid in blocked_uids:
+            continue
+        start = start_m.group(1)
+        iso = f"{start[:4]}-{start[4:6]}-{start[6:8]}"
+        if iso < today:
+            kept.append(block if block.endswith("\n") else block + "\n")
+    if not kept:
+        return ics
+    footer = VCALENDAR_FOOTER
+    if footer not in ics:
+        return ics + "".join(kept)
+    return ics.replace(footer, "".join(kept) + footer, 1)
+
+
+def team_calendar_ics(
+    team_name: str,
+    fixtures: list[Fixture],
+    results: list[Result],
+    *,
+    previous: str = "",
+    results_unavailable: bool = False,
+    league_has_results: bool | None = None,
+    today: str,
+) -> str:
+    """Calendar for one team: still-scheduled fixtures plus every result.
+
+    ``fixtures`` is the raw fixtures-page list, including postponed rows.
+    Those are left out. ``league_has_results`` is whether the league's results
+    page had any rows, not whether this team did — a postponed match is the
+    only fixture some teams have. When omitted it falls back to this team's
+    own results. When results could not be fetched, past events already on
+    the calendar are kept so the season does not disappear for a run.
+    """
+    if league_has_results is None:
+        league_has_results = bool(results)
+    live = scheduled_fixtures(
+        fixtures,
+        results,
+        today,
+        results_available=not results_unavailable and league_has_results,
+    )
+    ics = fixtures_to_ics(team_name, live, results)
+    if not results_unavailable:
+        return ics
+    blocked = {
+        calendar_uid(fixture, team_name)
+        for fixture in fixtures
+        if is_called_off(fixture.status) and team_name in (fixture.home_team, fixture.away_team)
+    }
+    return retain_past_events(ics, previous, today, blocked)
 
 
 def consolidate_matches(rows: list[dict]) -> list[dict]:
@@ -1726,6 +1932,7 @@ def _run(browser_holder: list) -> int:
             fixtures = []
 
         results_unavailable = False
+        results_failed = False
         try:
             results = fetch_results(season_id, league_name, browser=browser)
             results_report.append((
@@ -1744,6 +1951,7 @@ def _run(browser_holder: list) -> int:
         except Exception as e:
             log.error(f"Failed to fetch results for {league_name}: {e}")
             results = []
+            results_failed = True
             results_report.append((league_name, f"FAILED — {e}"))
 
         if not fixtures and not results:
@@ -1763,20 +1971,43 @@ def _run(browser_holder: list) -> int:
                 f"played matches will be missing from results and participation"
             )
 
-        # Group fixtures/results by team name
-        teams_fixtures: dict[str, list[Fixture]] = {}
-        for f in fixtures:
-            for team in (f.home_team, f.away_team):
-                if team:
-                    teams_fixtures.setdefault(team, []).append(f)
+        today = generated[:10]
+        raw_fixtures = fixtures
+        # Postponed and other called-off matches stay on Full-Time's fixtures
+        # page with no score. Once the league's results page has rows, a past
+        # open-age fixture that never scored is the same thing. Either way it
+        # is not published — played matches come back from the results page
+        # instead, which is what keeps them on the calendar. The flag is
+        # league-wide: a team with no result of its own is still unplayed.
+        league_has_results = bool(results) and not results_unavailable
+        fixtures = scheduled_fixtures(
+            raw_fixtures,
+            results,
+            today,
+            results_available=league_has_results,
+        )
+        dropped = len(raw_fixtures) - len(fixtures)
+        if dropped:
+            log.info(
+                f"  {league_name}: left {dropped} postponed or unplayed "
+                f"fixture(s) out of the feeds and calendars"
+            )
 
-        teams_results: dict[str, list[Result]] = {}
-        for r in results:
-            for team in (r.home_team, r.away_team):
-                if team:
-                    teams_results.setdefault(team, []).append(r)
+        def _by_team(matches):
+            grouped: dict[str, list] = {}
+            for match in matches:
+                for team in (match.home_team, match.away_team):
+                    if team:
+                        grouped.setdefault(team, []).append(match)
+            return grouped
 
-        all_teams = sorted(set(teams_fixtures) | set(teams_results))
+        raw_by_team = _by_team(raw_fixtures)
+        teams_fixtures = _by_team(fixtures)
+        teams_results = _by_team(results)
+
+        # Teams that only have a postponed fixture must still be rewritten,
+        # or the old calendar keeps the match we are trying to remove.
+        all_teams = sorted(set(raw_by_team) | set(teams_results))
 
         league_slug_name = slug(league_name)
         league_dir = OUTPUT_DIR / league_slug_name
@@ -1784,14 +2015,25 @@ def _run(browser_holder: list) -> int:
 
         log.info(f"  {len(all_teams)} teams, writing to {league_dir}/")
 
-        # --- ICS calendars (fixtures only) ---
+        keep_history = results_unavailable or results_failed
         for team_name in all_teams:
-            team_fixtures = teams_fixtures.get(team_name, [])
-            if team_fixtures:
-                ics_content = fixtures_to_ics(team_name, team_fixtures)
-                filename = league_dir / f"{slug(team_name)}.ics"
+            filename = league_dir / f"{slug(team_name)}.ics"
+            previous = filename.read_text(encoding="utf-8") if filename.is_file() else ""
+            team_results = teams_results.get(team_name, [])
+            ics_content = team_calendar_ics(
+                team_name,
+                raw_by_team.get(team_name, []),
+                team_results,
+                previous=previous,
+                results_unavailable=keep_history,
+                league_has_results=bool(results),
+                today=today,
+            )
+            if "BEGIN:VEVENT" in ics_content or filename.is_file():
                 filename.write_text(ics_content, encoding="utf-8")
-                log.info(f"    {filename.name} ({len(team_fixtures)} fixtures)")
+                log.info(
+                    f"    {filename.name} ({ics_content.count('BEGIN:VEVENT')} events)"
+                )
 
         # --- JSON feeds (league + team level) ---
         if results_unavailable:
