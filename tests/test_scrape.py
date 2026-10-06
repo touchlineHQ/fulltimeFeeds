@@ -1540,12 +1540,13 @@ class TestScheduledFixtures:
 
         assert kept == [postponed]
 
-    def test_an_empty_results_page_does_not_wipe_past_fixtures(self):
-        # results_available means the page was reached; an empty list is a
-        # league that has not played, or a parse that found nothing.
+    def test_a_team_with_no_row_is_unplayed_when_the_league_has_results(self):
+        # The flag is league-wide. An empty list means this team scored
+        # nothing, not that the results page was empty — the caller only sets
+        # results_available once the page had rows.
         past = _fx("27/09/26", "Home U12", "Away U12")
 
-        assert scheduled_fixtures([past], [], TODAY, results_available=True) == [past]
+        assert scheduled_fixtures([past], [], TODAY, results_available=True) == []
 
     def test_past_restricted_fixture_is_kept_for_participation(self):
         past = _fx("27/09/26", "Demo FC U10", "Riverside U10", division="U10 Sunday")
@@ -1633,6 +1634,20 @@ class TestCalendarKeepsHistory:
         assert "Attenborough" not in ics
         assert "Eastwood Athletic Blazers U12 (Home) 3-2" in ics
         assert "Heanor Town Hurricanes U12" in ics
+
+    def test_a_team_with_no_results_of_its_own_still_drops_the_past_fixture(self):
+        # The league results page had rows. This team has none, so the past
+        # fixture is the postponed one — it must leave the calendar as well as
+        # the feeds.
+        team = "East Leake Bantams Green U12"
+        postponed = _fx("27/09/26", "Attenborough Colts Green U12", team)
+
+        ics = team_calendar_ics(
+            team, [postponed], [], league_has_results=True, today=TODAY,
+        )
+
+        assert "Attenborough" not in ics
+        assert "BEGIN:VEVENT" not in ics
 
     def test_main_publishes_history_and_omits_the_unplayed_fixture(self, tmp_path, monkeypatch):
         monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")

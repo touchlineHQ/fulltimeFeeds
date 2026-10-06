@@ -15,9 +15,11 @@ Updated daily by a local cron job.
 
 The calendar will auto-refresh (Google typically polls every 12–24 hours).
 Played matches stay on it after they leave Full-Time's fixtures page, with the
-score in the title where one may be published. A postponed, cancelled or
-abandoned match is left off — including one Full-Time is still listing after
-its date with no result.
+score in the title where one may be published. A match marked postponed,
+cancelled or abandoned is left off. So is a past open-age fixture missing from
+a results page that was read and actually had rows. U11 and below stay unless
+the match is explicitly called off. If results cannot be fetched, past events
+already on the calendar are kept.
 
 > **Tip:** The calendar URL looks like:
 > `https://fixtures.touchlinehq.co.uk/calendars/yel-east-midlands-sunday-25-26/eastwood-athletic-atalanta-u10.ics`
@@ -120,11 +122,13 @@ place:
   `results` only. It stays on the team calendar either way.
 - **A postponed match is left out.** Full-Time also keeps postponed, cancelled
   and abandoned games on the fixtures page, often with no status filled in.
-  Those are not published: a status that says the game was called off is
-  enough, and so is a past open-age fixture with no result once the results
-  page has been read. U11 and below are the exception to the second test,
-  because those scores are not published — a past restricted fixture is
-  treated as played, unless it is explicitly called off.
+  A status that says the game was called off is enough to leave it unpublished.
+  So is a past open-age fixture with no result, but only once the results page
+  was read and contained rows — an empty or refused page is not evidence the
+  match was postponed. U11 and below are the exception to that second test,
+  because those scores are not published: a past restricted fixture is treated
+  as played unless it is explicitly called off. If results cannot be fetched,
+  past events already on a calendar are kept.
 - **A club derby is listed once.** When both teams belong to the same club, the
   match is scraped for each side; the club feed keeps the home side's row —
   which already names both teams the right way round — and marks it

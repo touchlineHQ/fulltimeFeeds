@@ -1069,9 +1069,12 @@ def scheduled_fixtures(
     called-off status still removes them.
     """
     played = {_match_id(r.date, r.home_team, r.away_team) for r in results}
-    # An empty results array is also what a parser failure looks like.  Only
-    # treat "no score" as postponed when the results page actually had rows.
-    know_unplayed = results_available and bool(results)
+    # ``results`` may be a single team's rows. ``results_available`` is set by
+    # the caller only when the league's results page had rows, so a team with
+    # nothing of its own is still judged against the league. An empty page, or
+    # a page that could not be read, must be passed as results_available=False
+    # — otherwise every past open-age fixture would look postponed.
+    know_unplayed = results_available
     kept: list[Fixture] = []
     for fixture in fixtures:
         if is_called_off(fixture.status):
@@ -1150,16 +1153,25 @@ def team_calendar_ics(
     *,
     previous: str = "",
     results_unavailable: bool = False,
+    league_has_results: bool | None = None,
     today: str,
 ) -> str:
     """Calendar for one team: still-scheduled fixtures plus every result.
 
     ``fixtures`` is the raw fixtures-page list, including postponed rows.
-    Those are left out. When results could not be fetched, past events already
-    on the calendar are kept so the season does not disappear for a run.
+    Those are left out. ``league_has_results`` is whether the league's results
+    page had any rows, not whether this team did — a postponed match is the
+    only fixture some teams have. When omitted it falls back to this team's
+    own results. When results could not be fetched, past events already on
+    the calendar are kept so the season does not disappear for a run.
     """
+    if league_has_results is None:
+        league_has_results = bool(results)
     live = scheduled_fixtures(
-        fixtures, results, today, results_available=not results_unavailable and bool(results),
+        fixtures,
+        results,
+        today,
+        results_available=not results_unavailable and league_has_results,
     )
     ics = fixtures_to_ics(team_name, live, results)
     if not results_unavailable:
@@ -1962,15 +1974,17 @@ def _run(browser_holder: list) -> int:
         today = generated[:10]
         raw_fixtures = fixtures
         # Postponed and other called-off matches stay on Full-Time's fixtures
-        # page with no score. Once we have real results, a past open-age
-        # fixture that never scored is the same thing. Either way it is not
-        # published — played matches come back from the results page instead,
-        # which is what keeps them on the calendar.
+        # page with no score. Once the league's results page has rows, a past
+        # open-age fixture that never scored is the same thing. Either way it
+        # is not published — played matches come back from the results page
+        # instead, which is what keeps them on the calendar. The flag is
+        # league-wide: a team with no result of its own is still unplayed.
+        league_has_results = bool(results) and not results_unavailable
         fixtures = scheduled_fixtures(
             raw_fixtures,
             results,
             today,
-            results_available=bool(results) and not results_unavailable,
+            results_available=league_has_results,
         )
         dropped = len(raw_fixtures) - len(fixtures)
         if dropped:
@@ -2012,6 +2026,7 @@ def _run(browser_holder: list) -> int:
                 team_results,
                 previous=previous,
                 results_unavailable=keep_history,
+                league_has_results=bool(results),
                 today=today,
             )
             if "BEGIN:VEVENT" in ics_content or filename.is_file():
