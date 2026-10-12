@@ -33,14 +33,15 @@ SEASON_RE = re.compile(r"selectedSeason=(\d+)")
 ROW_MARKER = "home-team"
 _SHELL_RE = re.compile(r"</?(?:html|head|body)[^>]*>|\s+", re.IGNORECASE)
 
-
-def is_unloaded(html: str) -> bool:
-    return not _SHELL_RE.sub("", html)
-
 STATUS_EVERY = 30.0
 _last_status = 0.0
 _passes = 0
-TAB_TIMEOUT = 5.0
+TAB_TIMEOUT = 8.0
+
+
+def is_unloaded(html: str) -> bool:
+    """True for the empty document a tab that was never visited returns."""
+    return not _SHELL_RE.sub("", html)
 
 
 def _safe_targets(endpoint: str) -> list[dict]:
@@ -92,14 +93,34 @@ def _page_html(ws_url: str, timeout: float = TAB_TIMEOUT) -> str:
             pass
 
 
-def _reload(ws_url: str | None) -> None:
+def _activate(ws_url: str | None) -> None:
     if not ws_url:
         return
     try:
         import websocket
         connection = websocket.create_connection(ws_url, timeout=TAB_TIMEOUT, suppress_origin=True)
         try:
-            connection.send(json.dumps({"id": 1, "method": "Page.reload", "params": {"ignoreCache": True}}))
+            connection.send(json.dumps({"id": 1, "method": "Page.bringToFront"}))
+            connection.recv()
+        finally:
+            connection.close()
+    except Exception:
+        pass
+
+
+def _navigate(ws_url: str | None, url: str) -> None:
+    """Force the tab onto its correct URL when background loading served the wrong page."""
+    if not ws_url or not url:
+        return
+    try:
+        import websocket
+        connection = websocket.create_connection(ws_url, timeout=TAB_TIMEOUT, suppress_origin=True)
+        try:
+            connection.send(json.dumps({
+                "id": 1,
+                "method": "Page.navigate",
+                "params": {"url": url},
+            }))
             connection.recv()
         finally:
             connection.close()
@@ -130,22 +151,28 @@ def open_results_tabs(endpoint: str) -> list[tuple[str, str, str]]:
             continue
         if html:
             found.append((season.group(1), url, html))
+    if not found:
+        _report_idle(len(targets))
     return found
 
 
-def _activate(ws_url: str | None) -> None:
-    if not ws_url:
+def _report_idle(open_tabs: int) -> None:
+    """Say why nothing is being saved."""
+    global _last_status
+    now = time.time()
+    if _passes > 3 and now - _last_status < STATUS_EVERY:
         return
-    try:
-        import websocket
-        connection = websocket.create_connection(ws_url, timeout=TAB_TIMEOUT, suppress_origin=True)
-        try:
-            connection.send(json.dumps({"id": 1, "method": "Page.bringToFront"}))
-            connection.recv()
-        finally:
-            connection.close()
-    except Exception:
-        pass
+    _last_status = now
+    if open_tabs:
+        log.info(f"  waiting — {open_tabs} tab(s) open, none of them a loaded "
+                 f"results page yet")
+    else:
+        log.info("  waiting — no tabs open in the browser yet")
+
+
+def _first_home_team(html: str) -> str:
+    m = re.search(r"home-team[^>]*>.*?>([^<]+)", html, re.DOTALL | re.IGNORECASE)
+    return (m.group(1).strip() if m else "")
 
 
 def save_ready_tabs(endpoint: str, out_dir: pathlib.Path, saved: set[str]) -> int:
@@ -153,70 +180,102 @@ def save_ready_tabs(endpoint: str, out_dir: pathlib.Path, saved: set[str]) -> in
     _passes += 1
     names = league_names()
     written = 0
-    ws_by_season = {
-        SEASON_RE.search(t.get("url", "")).group(1): t.get("webSocketDebuggerUrl")
-        for t in _safe_targets(endpoint)
-        if SEASON_RE.search(t.get("url", "")) and "/results/" in t.get("url", "")
-    }
-    seen_hashes = set()
+    targets = _safe_targets(endpoint)
+    ws_by_season = {}
+    url_by_season = {}
+    for t in targets:
+        url = t.get("url", "")
+        m = SEASON_RE.search(url)
+        if m and "/results/" in url:
+            sid = m.group(1)
+            ws_by_season[sid] = t.get("webSocketDebuggerUrl")
+            url_by_season[sid] = url
+
+    seen_signatures: set[str] = set()
+
     for season_id, url, html in open_results_tabs(endpoint):
         if season_id in saved:
             continue
         label = names.get(season_id, f"season {season_id}")
+        expected_url = url_by_season.get(season_id, url)
+
         if is_unloaded(html):
             log.info(f"  {label}: tab not loaded yet — bringing it to the front")
             _activate(ws_by_season.get(season_id))
             continue
+
         marker = f"selectedSeason={season_id}"
         if marker not in html:
-            log.info(f"  {label}: loaded page does not contain its season marker — reloading")
+            log.info(f"  {label}: loaded page does not contain its season marker — navigating")
             _activate(ws_by_season.get(season_id))
-            _reload(ws_by_season.get(season_id))
+            _navigate(ws_by_season.get(season_id), expected_url)
             continue
+
         if ROW_MARKER not in html:
             if is_challenge_page(html):
                 log.info(f"  {label}: still showing a challenge — solve it in the browser")
             else:
-                log.info(f"  {label}: loaded, but holds no results table")
+                log.info(f"  {label}: loaded, but holds no results table "
+                         f"(this league may not have played yet)")
             continue
-        import hashlib
-        content_hash = hashlib.md5(html.encode("utf-8", errors="replace")).hexdigest()
-        if content_hash in seen_hashes:
-            log.warning(f"  {label}: content identical to a previously saved league — reloading")
+
+        sig = _first_home_team(html)
+        try:
+            rows = len(scrape.parse_results(html))
+        except Exception:
+            rows = 0
+        signature = f"{sig}|{rows}"
+
+        if signature in seen_signatures and rows < 800:
+            log.warning(
+                f"  {label}: looks like a duplicate ({rows} rows, first {sig!r}) "
+                f"— navigating to its own URL"
+            )
             _activate(ws_by_season.get(season_id))
-            _reload(ws_by_season.get(season_id))
+            _navigate(ws_by_season.get(season_id), expected_url)
             continue
-        seen_hashes.add(content_hash)
+
+        seen_signatures.add(signature)
+
         destination = out_dir / f"{season_id}.html"
         destination.write_text(html, encoding="utf-8")
         saved.add(season_id)
         written += 1
-        rows = len(scrape.parse_results(html))
         log.info(f"  {label}: saved {destination.name} ({rows} result(s))")
+
     return written
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--endpoint", default="http://localhost:9222")
-    ap.add_argument("--out", default=None)
-    ap.add_argument("--watch", action="store_true")
+    ap.add_argument("--endpoint", default="http://localhost:9222",
+                    help="the VNC browser's debugging endpoint")
+    ap.add_argument("--out", default=None, help="where to write (RESULTS_HTML_DIR)")
+    ap.add_argument("--watch", action="store_true",
+                    help="keep watching, saving each tab as it finishes loading")
     ap.add_argument("--interval", type=float, default=5.0)
     args = ap.parse_args()
+
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     import os
-    out_dir = pathlib.Path(args.out or os.environ.get(scrape.RESULTS_HTML_DIR_ENV) or scrape.DEFAULT_RESULTS_HTML_DIR)
+    out_dir = pathlib.Path(
+        args.out or os.environ.get(scrape.RESULTS_HTML_DIR_ENV)
+        or scrape.DEFAULT_RESULTS_HTML_DIR
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     log.info(f"Saving results tabs into {out_dir}\n")
-    saved = set()
+
+    saved: set[str] = set()
     total_leagues = len(scrape.LEAGUES)
     log.info(f"Watching for {total_leagues} league(s) at {args.endpoint}")
+
     try:
         while True:
             try:
                 save_ready_tabs(args.endpoint, out_dir, saved)
             except Exception as e:
-                log.warning(f"Could not read the browser: {e}")
+                log.warning(f"Could not read the browser at {args.endpoint}: {e}")
             if not args.watch:
                 break
             if len(saved) >= total_leagues:
@@ -225,7 +284,10 @@ def main() -> int:
             time.sleep(args.interval)
     except KeyboardInterrupt:
         log.info("\nStopped.")
+
     log.info(f"\n{len(saved)} of {total_leagues} league(s) saved to {out_dir}")
+    if saved:
+        log.info("The next scrape will parse them.")
     return 0 if saved else 1
 
 
