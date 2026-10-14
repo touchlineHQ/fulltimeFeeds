@@ -204,19 +204,21 @@ def save_ready_tabs(endpoint: str, out_dir: pathlib.Path, saved: set[str]) -> in
             _activate(ws_by_season.get(season_id))
             continue
 
-        marker = f"selectedSeason={season_id}"
-        if marker not in html:
-            log.info(f"  {label}: loaded page does not contain its season marker — navigating")
-            _activate(ws_by_season.get(season_id))
-            _navigate(ws_by_season.get(season_id), expected_url)
-            continue
-
         if ROW_MARKER not in html:
             if is_challenge_page(html):
                 log.info(f"  {label}: still showing a challenge — solve it in the browser")
             else:
                 log.info(f"  {label}: loaded, but holds no results table "
                          f"(this league may not have played yet)")
+            continue
+
+        # Only a page with results can be the wrong season; a challenge or empty
+        # page has no season link, and navigating it would restart the challenge.
+        marker = f"selectedSeason={season_id}"
+        if marker not in html:
+            log.info(f"  {label}: loaded page does not contain its season marker — navigating")
+            _activate(ws_by_season.get(season_id))
+            _navigate(ws_by_season.get(season_id), expected_url)
             continue
 
         sig = _first_home_team(html)
