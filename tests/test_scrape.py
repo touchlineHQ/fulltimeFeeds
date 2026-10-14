@@ -1649,6 +1649,32 @@ class TestFetchResultsFromSavedPage:
         assert directory.divisions["division one"] == "1_222222222"
         assert directory.teams["east leake robins"] == "948523730"
 
+    def test_a_live_page_with_some_divisions_keeps_the_saved_ones_too(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        path = _saved_page(tmp_path, "918978398", rows=1)
+        page = path.read_text(encoding="utf-8")
+        live = page.replace(
+            "</body>",
+            '<select id="form1_selectedFixtureGroupKey"><option value>All</option>'
+            '<option value="1_222222222">Division One</option></select></body>',
+        )
+        path.write_text(
+            page.replace(
+                "</body>",
+                '<select id="form1_selectedFixtureGroupKey"><option value>All</option>'
+                '<option value="1_106623061">Division One</option>'
+                '<option value="1_333333333">Division Two</option></select></body>',
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: live)
+
+        scrape.fetch_results("918978398", "Euro Soccer", browser=None)
+
+        divisions = scrape.fetch_results.last_directory.divisions
+        assert divisions["division one"] == "1_222222222"
+        assert divisions["division two"] == "1_333333333"
+
     def test_a_working_fetch_is_preferred_over_a_saved_page(self, tmp_path, monkeypatch):
         # A saved page is a fallback, not a cache: live data is fresher.
         monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))

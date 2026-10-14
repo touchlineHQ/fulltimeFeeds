@@ -626,17 +626,15 @@ def _remember_directory(html: str, season_id: str | None = None) -> None:
     lists every division and team.
     """
     found = parse_fulltime_directory(html or "")
-    if not (found.divisions and found.teams) and season_id is not None:
-        # A live page can carry the results without one or both dropdowns; a
-        # saved page for the same season fills whichever is missing, and the
-        # live page's ids are kept wherever it has them.
+    if season_id is not None:
+        # A live page can carry the results with one or both dropdowns missing
+        # or only partly filled; a saved page for the same season fills in any
+        # division or team it lacks, and the live page's id wins for a label
+        # both pages list.
         saved = _saved_results_page(season_id)
         if saved:
             backup = parse_fulltime_directory(saved[0] or "")
-            found = FullTimeDirectory(
-                found.divisions or backup.divisions,
-                found.teams or backup.teams,
-            )
+            found = merge_directories(backup, found)
     if found.divisions or found.teams:
         fetch_results.last_directory = found
 
