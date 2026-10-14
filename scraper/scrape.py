@@ -264,6 +264,18 @@ class FullTimeDirectory(NamedTuple):
 EMPTY_DIRECTORY = FullTimeDirectory({}, {})
 
 
+def merge_directories(base: FullTimeDirectory, extra: FullTimeDirectory) -> FullTimeDirectory:
+    """Union two id lists. ``extra`` wins where the same label is in both."""
+    if not extra.divisions and not extra.teams:
+        return base
+    if not base.divisions and not base.teams:
+        return extra
+    return FullTimeDirectory(
+        {**base.divisions, **extra.divisions},
+        {**base.teams, **extra.teams},
+    )
+
+
 def _label_key(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().casefold()
 
@@ -271,6 +283,8 @@ def _label_key(text: str) -> str:
 def _option_map(soup, select_id: str, value_re: re.Pattern[str], *, clean) -> dict[str, str]:
     """Map option text to value for one Full-Time filter dropdown."""
     select = soup.find("select", id=select_id)
+    if select is None:
+        select = soup.find("select", attrs={"name": select_id.removeprefix("form1_")})
     if select is None:
         return {}
     found: dict[str, str] = {}
@@ -539,6 +553,7 @@ def fetch_results(
     """
     global LAST_SOURCE
     LAST_SOURCE = ""
+    fetch_results.last_directory = EMPTY_DIRECTORY
     url = f"{RESULTS_URL}?selectedSeason={season_id}&selectedFixtureGroupKey="
     label = f"results/{league_name}"
     log.info(f"Fetching results for {league_name} ...")
@@ -558,6 +573,7 @@ def fetch_results(
         # throw away results we had already been given.
         if results or not is_challenge_page(html):
             LAST_SOURCE = "a plain fetch"
+            _remember_directory(html)
             return results
 
     if browser is not None:
@@ -576,6 +592,7 @@ def fetch_results(
             if results or not is_challenge_page(rendered):
                 log.info(f"  {label}: {len(results)} result(s) via the browser")
                 LAST_SOURCE = "the browser"
+                _remember_directory(rendered)
                 return results
 
     saved = _saved_results_page(season_id)
@@ -592,12 +609,28 @@ def fetch_results(
                 f"  {label}: that saved page is {age_days:.0f} days old — "
                 f"save a fresh one to pick up recent results"
             )
+        _remember_directory(saved_html)
         return results
 
     raise ResultsUnavailable(
         f"{league_name}: results page refused ({refusal or 'challenge page'}), "
         f"no browser got through, and no saved page was found"
     )
+
+
+def _remember_directory(html: str) -> None:
+    """Keep division and team ids from a results page a browser actually rendered.
+
+    The fixtures download often has the match table and not the filter
+    dropdowns. A saved results page is the rendered document, and that form
+    lists every division and team.
+    """
+    found = parse_fulltime_directory(html or "")
+    if found.divisions or found.teams:
+        fetch_results.last_directory = found
+
+
+fetch_results.last_directory = EMPTY_DIRECTORY
 
 
 def merge_results(primary: list[Result], extra: list[Result]) -> list[Result]:
@@ -2312,7 +2345,20 @@ def _run(browser_holder: list) -> int:
                 )
                 results_report[-1] = (league_name, f"{results_report[-1][1]} — {note}")
 
-        directory = getattr(fetch_fixtures, "last_directory", EMPTY_DIRECTORY)
+        directory = merge_directories(
+            getattr(fetch_fixtures, "last_directory", EMPTY_DIRECTORY),
+            getattr(fetch_results, "last_directory", EMPTY_DIRECTORY),
+        )
+        if directory.divisions or directory.teams:
+            log.info(
+                f"  {league_name}: {len(directory.divisions)} division id(s), "
+                f"{len(directory.teams)} team id(s)"
+            )
+        else:
+            log.warning(
+                f"  {league_name}: no division or team ids on the fixtures page "
+                f"or the saved results page"
+            )
         fixtures = stamp_divisions(fixtures, directory.divisions, season_id)
         results = stamp_divisions(results, directory.divisions, season_id)
 
