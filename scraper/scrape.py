@@ -573,7 +573,7 @@ def fetch_results(
         # throw away results we had already been given.
         if results or not is_challenge_page(html):
             LAST_SOURCE = "a plain fetch"
-            _remember_directory(html)
+            _remember_directory(html, season_id)
             return results
 
     if browser is not None:
@@ -592,7 +592,7 @@ def fetch_results(
             if results or not is_challenge_page(rendered):
                 log.info(f"  {label}: {len(results)} result(s) via the browser")
                 LAST_SOURCE = "the browser"
-                _remember_directory(rendered)
+                _remember_directory(rendered, season_id)
                 return results
 
     saved = _saved_results_page(season_id)
@@ -618,7 +618,7 @@ def fetch_results(
     )
 
 
-def _remember_directory(html: str) -> None:
+def _remember_directory(html: str, season_id: str | None = None) -> None:
     """Keep division and team ids from a results page a browser actually rendered.
 
     The fixtures download often has the match table and not the filter
@@ -626,6 +626,12 @@ def _remember_directory(html: str) -> None:
     lists every division and team.
     """
     found = parse_fulltime_directory(html or "")
+    if not (found.divisions or found.teams) and season_id is not None:
+        # A live page can carry the results without the dropdowns; a saved
+        # page for the same season still has them.
+        saved = _saved_results_page(season_id)
+        if saved:
+            found = parse_fulltime_directory(saved[0] or "")
     if found.divisions or found.teams:
         fetch_results.last_directory = found
 
