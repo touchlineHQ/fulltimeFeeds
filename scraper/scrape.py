@@ -250,6 +250,7 @@ TABLE_URL = (
 TEAM_URL = "https://fulltime.thefa.com/displayTeam.html?id={team_id}"
 _DIVISION_ID_RE = re.compile(r"^\d+_\d+$")
 _TEAM_ID_RE = re.compile(r"^\d+$")
+_SEASON_ID_RE = re.compile(r"^\d+$")
 _CUP_RE = re.compile(r"\bcups?\b", re.IGNORECASE)
 
 
@@ -315,6 +316,8 @@ def division_link(
     their tables. Anything that does not match a dropdown label gets nothing.
     """
     if not division_label or not divisions or not season_id:
+        return "", ""
+    if not _SEASON_ID_RE.fullmatch(season_id):
         return "", ""
     label = clean_team_name(division_label)
     if _CUP_RE.search(label):

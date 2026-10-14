@@ -1043,6 +1043,19 @@ class TestFullTimeLinks:
         assert row["division_id"] == stamped.division_id
         assert row["table_url"] == stamped.table_url
 
+    def test_bad_season_id_is_not_put_in_table_url(self):
+        match = Fixture(
+            "11/10/26", "10:00", "Alfreton Town AllStars U14", "Arnold Town Maroon U14",
+            "The Ground", "U14 Sunday",
+        )
+        divisions = scrape.parse_fulltime_directory(_DIRECTORY_HTML).divisions
+
+        stamped = scrape.stamp_divisions([match], divisions, "876713597/evil")[0]
+
+        assert stamped.division_id == ""
+        assert stamped.table_url == ""
+        assert "division_id" not in scrape.fixture_to_dict(stamped)
+
     def test_cups_and_u11_are_not_linked(self):
         divisions = scrape.parse_fulltime_directory(_DIRECTORY_HTML).divisions
         cup = Fixture(
