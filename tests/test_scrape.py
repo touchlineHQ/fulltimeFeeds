@@ -1100,6 +1100,13 @@ class TestFullTimeLinks:
         assert payload["fulltime_url"] == page["fulltime_url"]
         assert scrape.team_page_fields("AJ Sport Black U8", teams) == {}
 
+    def test_team_in_restricted_division_gets_no_team_page(self):
+        teams = scrape.parse_fulltime_directory(_DIRECTORY_HTML).teams
+        name = "East Leake Bantams Green^ U12"
+
+        assert scrape.team_page_fields(name, teams, ["Under 9 Division A"]) == {}
+        assert scrape.team_page_fields(name, teams, ["", None, "Under 13 Division A"])["team_id"] == "948523730"
+
     def test_club_feed_lists_open_age_team_pages(self, tmp_path, monkeypatch):
         monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
         row = {

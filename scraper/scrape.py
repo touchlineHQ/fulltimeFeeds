@@ -13,7 +13,7 @@ import hashlib
 import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import NamedTuple
+from typing import Iterable, NamedTuple
 
 from curl_cffi import requests as curl_requests
 from bs4 import BeautifulSoup
@@ -347,12 +347,20 @@ def stamp_divisions(matches: list, divisions: dict[str, str], season_id: str) ->
     return stamped
 
 
-def team_page_fields(team_name: str, teams: dict[str, str]) -> dict[str, str]:
+def team_page_fields(
+    team_name: str,
+    teams: dict[str, str],
+    labels: Iterable[str | None] = (),
+) -> dict[str, str]:
     """``team_id`` and ``fulltime_url`` for one open-age team, or nothing.
 
-    U11 and below are left without a public team-page link for now.
+    U11 and below are left without a public team-page link for now. A team
+    name with no age token is only open-age if none of its division
+    ``labels`` name a restricted age group either.
     """
     if not team_name or is_restricted(team_name):
+        return {}
+    if any(is_restricted(team_name, label) for label in labels if label):
         return {}
     team_id = teams.get(_label_key(clean_team_name(team_name)), "")
     if not team_id:
@@ -2398,7 +2406,18 @@ def _run(browser_holder: list) -> int:
         team_index_entries: list[dict] = []
         for team_name in all_teams:
             team_slug_name = slug(team_name)
-            page = team_page_fields(team_name, directory.teams)
+            division_labels = [
+                match.division_label
+                for match in (
+                    *raw_by_team.get(team_name, []),
+                    *teams_results.get(team_name, []),
+                )
+            ]
+            division_labels.extend(
+                record.get("division", "")
+                for record in retained_participation.get(team_name, [])
+            )
+            page = team_page_fields(team_name, directory.teams, division_labels)
             if page:
                 team_pages[team_name] = page
             write_team_feed(
