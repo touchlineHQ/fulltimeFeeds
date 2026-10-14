@@ -88,7 +88,9 @@ Fixture (in `fixtures.json` and `fixtures` arrays):
   "home_team": "Arnold Town Blue U13",
   "away_team": "Opponent FC U13",
   "venue": "The Ground",
-  "division": "U13 Division 1"
+  "division": "U13 Division 1",
+  "division_id": "1_106623061",
+  "table_url": "https://fulltime.thefa.com/table.html?selectedSeason=876713597&selectedFixtureGroupKey=1_106623061"
 }
 ```
 
@@ -104,11 +106,17 @@ Result (in `results.json` and `results` arrays):
   "home_score": 3,
   "away_score": 1,
   "venue": "The Ground",
-  "division": "U13 Division 1"
+  "division": "U13 Division 1",
+  "division_id": "1_106623061",
+  "table_url": "https://fulltime.thefa.com/table.html?selectedSeason=876713597&selectedFixtureGroupKey=1_106623061"
 }
 ```
 
 Team and club feeds additionally include `league`, `team`, `home_away` (`"home"` or `"away"`), `opponent`, and (results only) `goals_for` and `goals_against`.
+
+`division_id` and `table_url` are present only when the division is a league table Full-Time publishes. Cup ties are left out, and so is anything at U11 or below. The id is the fixture-group key from the fixtures page (`1_106623061` for U14 Sunday), not the league id.
+
+An open-age team feed also has `team_id` and `fulltime_url` (`displayTeam.html?id=`). `teams.json`, the index, and a club feed's `teams` array carry the same pair. U11 and below do not, for now.
 
 ### One match, one row
 

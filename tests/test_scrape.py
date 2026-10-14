@@ -995,6 +995,167 @@ class TestResultsUnavailableFlag:
 
 
 # ---------------------------------------------------------------------------
+# Full-Time ids: division tables and team pages
+# ---------------------------------------------------------------------------
+
+_DIRECTORY_HTML = """
+<select id="form1_selectedFixtureGroupKey" name="selectedFixtureGroupKey">
+  <option value>All</option>
+  <option value="1_106623061">U14 Sunday</option>
+  <option value="1_998072028">U14 Sun Winter Div 1</option>
+</select>
+<select id="form1_selectedTeam" name="selectedTeam">
+  <option value>All</option>
+  <option value="840862768">Alfreton Town AllStars U14</option>
+  <option value="948523730">East Leake Bantams Green^ U12</option>
+  <option value="111">AJ Sport Black U8</option>
+</select>
+"""
+
+
+class TestFullTimeLinks:
+    def test_dropdowns_are_the_id_list(self):
+        directory = scrape.parse_fulltime_directory(_DIRECTORY_HTML)
+
+        assert directory.divisions == {
+            "u14 sunday": "1_106623061",
+            "u14 sun winter div 1": "1_998072028",
+        }
+        assert directory.teams["alfreton town allstars u14"] == "840862768"
+        assert directory.teams["east leake bantams green^ u12"] == "948523730"
+        assert "all" not in directory.divisions
+        assert "all" not in directory.teams
+
+    def test_league_match_links_to_its_table(self):
+        match = Fixture(
+            "11/10/26", "10:00", "Alfreton Town AllStars U14", "Arnold Town Maroon U14",
+            "The Ground", "U14 Sunday",
+        )
+        divisions = scrape.parse_fulltime_directory(_DIRECTORY_HTML).divisions
+        stamped = scrape.stamp_divisions([match], divisions, "876713597")[0]
+
+        assert stamped.division_id == "1_106623061"
+        assert stamped.table_url == (
+            "https://fulltime.thefa.com/table.html"
+            "?selectedSeason=876713597&selectedFixtureGroupKey=1_106623061"
+        )
+        row = scrape.fixture_to_dict(stamped)
+        assert row["division_id"] == stamped.division_id
+        assert row["table_url"] == stamped.table_url
+
+    def test_bad_season_id_is_not_put_in_table_url(self):
+        match = Fixture(
+            "11/10/26", "10:00", "Alfreton Town AllStars U14", "Arnold Town Maroon U14",
+            "The Ground", "U14 Sunday",
+        )
+        divisions = scrape.parse_fulltime_directory(_DIRECTORY_HTML).divisions
+
+        stamped = scrape.stamp_divisions([match], divisions, "876713597/evil")[0]
+
+        assert stamped.division_id == ""
+        assert stamped.table_url == ""
+        assert "division_id" not in scrape.fixture_to_dict(stamped)
+
+    def test_cups_and_u11_are_not_linked(self):
+        divisions = scrape.parse_fulltime_directory(_DIRECTORY_HTML).divisions
+        cup = Fixture(
+            "11/10/26", "10:00", "Alfreton Town AllStars U14", "Arnold Town Maroon U14",
+            "The Ground", "U14 County Cup",
+        )
+        young = Fixture(
+            "11/10/26", "10:00", "AJ Sport Black U8", "Other U8",
+            "The Ground", "U8 Sunday",
+        )
+        unknown = Fixture(
+            "11/10/26", "10:00", "Alfreton Town AllStars U14", "Arnold Town Maroon U14",
+            "The Ground", "Some Other Cup",
+        )
+
+        assert scrape.stamp_divisions([cup, young, unknown], divisions, "876713597") == [
+            cup, young, unknown,
+        ]
+        assert "division_id" not in scrape.fixture_to_dict(cup)
+        assert "table_url" not in scrape.fixture_to_dict(young)
+
+    def test_open_age_team_feed_links_to_the_team_page(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        teams = scrape.parse_fulltime_directory(_DIRECTORY_HTML).teams
+        page = scrape.team_page_fields("East Leake Bantams Green^ U12", teams)
+
+        scrape.write_team_feed(
+            "East Leake Bantams Green^ U12", "east-leake-bantams-green-u12",
+            "YEL Sunday", "yel-sunday", [], [], "2026-10-14T12:00:00Z",
+            team_page=page,
+        )
+        payload = json.loads(
+            (tmp_path / "feeds" / "yel-sunday" / "teams" / "east-leake-bantams-green-u12.json")
+            .read_text()
+        )
+
+        assert page == {
+            "team_id": "948523730",
+            "fulltime_url": "https://fulltime.thefa.com/displayTeam.html?id=948523730",
+        }
+        assert payload["team_id"] == "948523730"
+        assert payload["fulltime_url"] == page["fulltime_url"]
+        assert scrape.team_page_fields("AJ Sport Black U8", teams) == {}
+
+    def test_team_in_restricted_division_gets_no_team_page(self):
+        teams = scrape.parse_fulltime_directory(_DIRECTORY_HTML).teams
+        name = "East Leake Bantams Green^ U12"
+
+        assert scrape.team_page_fields(name, teams, ["Under 9 Division A"]) == {}
+        assert scrape.team_page_fields(name, teams, ["", None, "Under 13 Division A"])["team_id"] == "948523730"
+
+    def test_club_feed_lists_open_age_team_pages(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        row = {
+            "id": "abc",
+            "date": "2026-10-11",
+            "time": "10:00",
+            "team": "East Leake Bantams Green^ U12",
+            "home_team": "East Leake Bantams Green^ U12",
+            "away_team": "Arnold Town Maroon U12",
+            "home_away": "home",
+            "division": "U12 Sunday",
+        }
+        scrape.write_club_feed(
+            "East Leake", "east-leake", [row], [], "2026-10-14T12:00:00Z",
+            team_pages={
+                "East Leake Bantams Green^ U12": {
+                    "team_id": "948523730",
+                    "fulltime_url": "https://fulltime.thefa.com/displayTeam.html?id=948523730",
+                }
+            },
+        )
+        payload = json.loads((tmp_path / "feeds" / "clubs" / "east-leake.json").read_text())
+
+        assert payload["teams"] == [{
+            "name": "East Leake Bantams Green^ U12",
+            "team_id": "948523730",
+            "fulltime_url": "https://fulltime.thefa.com/displayTeam.html?id=948523730",
+        }]
+
+    def test_fixtures_request_asks_for_every_age_group(self, monkeypatch):
+        seen = []
+
+        def fetch(url, label):
+            seen.append(url)
+            return _DIRECTORY_HTML
+
+        monkeypatch.setattr(scrape, "_fetch_page", fetch)
+        scrape.fetch_fixtures("876713597", "YEL Sunday")
+
+        assert seen == [
+            "https://fulltime.thefa.com/fixtures/1/100000.html"
+            "?selectedSeason=876713597"
+            "&selectedFixtureGroupAgeGroup=0&selectedFixtureGroupKey="
+        ]
+        assert scrape.fetch_fixtures.last_directory.divisions["u14 sunday"] == "1_106623061"
+
+
+
+# ---------------------------------------------------------------------------
 # Borrowing the operator's own browser session
 # ---------------------------------------------------------------------------
 

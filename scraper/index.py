@@ -53,7 +53,11 @@ def teams_from_team_feeds(league_dir: Path) -> tuple[str, list[dict]] | None:
             continue
         if league_name is None:
             league_name = payload.get("league")
-        teams.append({"name": payload.get("team") or payload_path.stem, "slug": payload_path.stem})
+        entry = {"name": payload.get("team") or payload_path.stem, "slug": payload_path.stem}
+        for field in ("team_id", "fulltime_url"):
+            if payload.get(field):
+                entry[field] = payload[field]
+        teams.append(entry)
 
     if not teams:
         return None

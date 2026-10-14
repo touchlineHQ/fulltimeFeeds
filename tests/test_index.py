@@ -103,6 +103,8 @@ class TestLeagueEntries:
         (team_dir / "east-leake-bantams-green-u12.json").write_text(json.dumps({
             "team": "East Leake Bantams Green^ U12",
             "league": "YEL East Midlands Sunday 26/27",
+            "team_id": "948523730",
+            "fulltime_url": "https://fulltime.thefa.com/displayTeam.html?id=948523730",
         }), encoding="utf-8")
         (team_dir / "cotgrave-blue-u9.json").write_text(json.dumps({
             "team": "Cotgrave Blue U9",
@@ -116,7 +118,12 @@ class TestLeagueEntries:
             "slug": "yel-sunday",
             "teams": [
                 {"name": "Cotgrave Blue U9", "slug": "cotgrave-blue-u9"},
-                {"name": "East Leake Bantams Green^ U12", "slug": "east-leake-bantams-green-u12"},
+                {
+                    "name": "East Leake Bantams Green^ U12",
+                    "slug": "east-leake-bantams-green-u12",
+                    "team_id": "948523730",
+                    "fulltime_url": "https://fulltime.thefa.com/displayTeam.html?id=948523730",
+                },
             ],
         }]
 
