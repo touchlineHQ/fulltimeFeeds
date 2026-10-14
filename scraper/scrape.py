@@ -150,6 +150,8 @@ class Fixture(NamedTuple):
     venue: str         # home team's ground, if listed
     division_label: str
     status: str = ""   # Full-Time status notes, e.g. "Postponed" or ""
+    division_id: str = ""  # selectedFixtureGroupKey, e.g. "1_106623061"
+    table_url: str = ""
 
 
 class Result(NamedTuple):
@@ -161,6 +163,8 @@ class Result(NamedTuple):
     away_score: int | None
     venue: str
     division_label: str
+    division_id: str = ""
+    table_url: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -218,12 +222,145 @@ def fetch_fixtures(season_id: str, league_name: str) -> tuple[list[Fixture], lis
     the result, and at U11 and below some leagues never do. The score cell
     still says ``3 - 1`` or ``X - X``, so those rows come back as results
     rather than as matches still to be played.
+
+    ``selectedFixtureGroupAgeGroup=0`` is Age Group "All". Without it the
+    fixture-group and team dropdowns on this page stay on whichever division
+    the site opened first, and the ids below are only that division's.
     """
-    url = f"{FIXTURES_URL}?selectedSeason={season_id}&selectedFixtureGroupKey="
+    fetch_fixtures.last_directory = EMPTY_DIRECTORY
+    url = (
+        f"{FIXTURES_URL}?selectedSeason={season_id}"
+        f"&selectedFixtureGroupAgeGroup=0&selectedFixtureGroupKey="
+    )
     log.info(f"Fetching fixtures for {league_name} ...")
-    fixtures, played = parse_fixture_page(_fetch_page(url, f"fixtures/{league_name}"))
+    html = _fetch_page(url, f"fixtures/{league_name}")
+    fetch_fixtures.last_directory = parse_fulltime_directory(html)
+    fixtures, played = parse_fixture_page(html)
     log.info(f"  Found {len(fixtures)} fixtures ({len(played)} already played)")
     return fixtures, played
+
+
+# Full-Time's public ids, read from the dropdowns on the fixtures page the
+# scraper already downloads. A fixture group key is the division table. A
+# team option value is the id displayTeam.html accepts as ``id``.
+TABLE_URL = (
+    "https://fulltime.thefa.com/table.html"
+    "?selectedSeason={season}&selectedFixtureGroupKey={division_id}"
+)
+TEAM_URL = "https://fulltime.thefa.com/displayTeam.html?id={team_id}"
+_DIVISION_ID_RE = re.compile(r"^\d+_\d+$")
+_TEAM_ID_RE = re.compile(r"^\d+$")
+_CUP_RE = re.compile(r"\bcups?\b", re.IGNORECASE)
+
+
+class FullTimeDirectory(NamedTuple):
+    """Division label → fixture-group key, and team name → team id."""
+
+    divisions: dict[str, str]
+    teams: dict[str, str]
+
+
+EMPTY_DIRECTORY = FullTimeDirectory({}, {})
+
+
+def _label_key(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+def _option_map(soup, select_id: str, value_re: re.Pattern[str], *, clean) -> dict[str, str]:
+    """Map option text to value for one Full-Time filter dropdown."""
+    select = soup.find("select", id=select_id)
+    if select is None:
+        return {}
+    found: dict[str, str] = {}
+    for option in select.find_all("option"):
+        value = (option.get("value") or "").strip()
+        label = clean(option.get_text(" ", strip=True))
+        if not value or not label or label.casefold() == "all":
+            continue
+        if not value_re.fullmatch(value):
+            continue
+        found[_label_key(label)] = value
+    return found
+
+
+def parse_fulltime_directory(html: str) -> FullTimeDirectory:
+    """Read every division id and team id from a fixtures-page form.
+
+    The two selects are ``form1_selectedFixtureGroupKey`` and
+    ``form1_selectedTeam``. ``All`` is an empty option and is ignored.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    return FullTimeDirectory(
+        divisions=_option_map(
+            soup, "form1_selectedFixtureGroupKey", _DIVISION_ID_RE, clean=clean_team_name
+        ),
+        teams=_option_map(
+            soup, "form1_selectedTeam", _TEAM_ID_RE, clean=clean_team_name
+        ),
+    )
+
+
+def division_link(
+    division_label: str,
+    home_team: str,
+    away_team: str,
+    divisions: dict[str, str],
+    season_id: str,
+) -> tuple[str, str]:
+    """Return ``(division_id, table_url)`` for a publishable league match.
+
+    Cups are not in the fixture-group dropdown, and a label that says Cup is
+    skipped even when it is. U11 and below are skipped: the FA does not publish
+    their tables. Anything that does not match a dropdown label gets nothing.
+    """
+    if not division_label or not divisions or not season_id:
+        return "", ""
+    label = clean_team_name(division_label)
+    if _CUP_RE.search(label):
+        return "", ""
+    if is_restricted(home_team, away_team, label):
+        return "", ""
+    division_id = divisions.get(_label_key(label), "")
+    if not division_id:
+        return "", ""
+    return division_id, TABLE_URL.format(season=season_id, division_id=division_id)
+
+
+def stamp_divisions(matches: list, divisions: dict[str, str], season_id: str) -> list:
+    """Fill ``division_id`` and ``table_url`` from the fixtures-page dropdown.
+
+    An empty directory leaves rows alone, so a refused fixtures page does not
+    wipe links already kept from the last published feed.
+    """
+    if not divisions:
+        return matches
+    stamped = []
+    for match in matches:
+        division_id, url = division_link(
+            match.division_label, match.home_team, match.away_team, divisions, season_id
+        )
+        stamped.append(match._replace(division_id=division_id, table_url=url))
+    return stamped
+
+
+def team_page_fields(team_name: str, teams: dict[str, str]) -> dict[str, str]:
+    """``team_id`` and ``fulltime_url`` for one open-age team, or nothing.
+
+    U11 and below are left without a public team-page link for now.
+    """
+    if not team_name or is_restricted(team_name):
+        return {}
+    team_id = teams.get(_label_key(clean_team_name(team_name)), "")
+    if not team_id:
+        return {}
+    return {
+        "team_id": team_id,
+        "fulltime_url": TEAM_URL.format(team_id=team_id),
+    }
+
+
+fetch_fixtures.last_directory = EMPTY_DIRECTORY
 
 
 def _fetch_page_js(url: str, label: str) -> str:
@@ -1027,7 +1164,7 @@ def fixture_to_iso_date(date_str: str) -> str:
 
 def fixture_to_dict(fixture: Fixture) -> dict:
     """Serialise a Fixture to a plain dict for JSON output."""
-    return {
+    row = {
         "id": _match_id(fixture.date, fixture.home_team, fixture.away_team),
         "date": fixture_to_iso_date(fixture.date),
         "time": fixture.time or "10:00",
@@ -1036,11 +1173,15 @@ def fixture_to_dict(fixture: Fixture) -> dict:
         "venue": fixture.venue,
         "division": fixture.division_label,
     }
+    if fixture.division_id:
+        row["division_id"] = fixture.division_id
+        row["table_url"] = fixture.table_url
+    return row
 
 
 def result_to_dict(result: Result) -> dict:
     """Serialise a Result to a plain dict for JSON output."""
-    return {
+    row = {
         "id": _match_id(result.date, result.home_team, result.away_team),
         "date": fixture_to_iso_date(result.date),
         "time": result.time or "10:00",
@@ -1051,6 +1192,10 @@ def result_to_dict(result: Result) -> dict:
         "venue": result.venue,
         "division": result.division_label,
     }
+    if result.division_id:
+        row["division_id"] = result.division_id
+        row["table_url"] = result.table_url
+    return row
 
 
 def _fa_date(iso: str) -> str:
@@ -1075,6 +1220,8 @@ def result_from_published(row: dict) -> Result | None:
         away_score=row.get("away_score"),
         venue=row.get("venue") or "",
         division_label=row.get("division") or "",
+        division_id=row.get("division_id") or "",
+        table_url=row.get("table_url") or "",
     )
 
 
@@ -1438,6 +1585,7 @@ def write_team_feed(
     generated: str,
     results_unavailable: bool = False,
     extra_participation: list[dict] | None = None,
+    team_page: dict[str, str] | None = None,
 ) -> None:
     """Write a JSON file with fixtures and results relevant to a single team.
 
@@ -1499,6 +1647,7 @@ def write_team_feed(
         "league": league_name,
         "generated": generated,
         **({"results_unavailable": True} if results_unavailable else {}),
+        **(team_page or {}),
         "compliance": compliance_meta(results_withheld),
         "fixtures": team_fixtures,
         "results": team_results,
@@ -1848,6 +1997,25 @@ def build_prefix_counts(team_names: list[str]) -> dict[str, int]:
     return counts
 
 
+def _club_team_links(
+    fixtures: list[dict],
+    results: list[dict],
+    participation: list[dict],
+    team_pages: dict[str, dict],
+) -> list[dict]:
+    """Team-page links for the open-age sides in one club feed."""
+    names: set[str] = set()
+    for row in (*fixtures, *results, *participation):
+        team = row.get("team")
+        if team:
+            names.add(team)
+    return [
+        {"name": name, **team_pages[name]}
+        for name in sorted(names)
+        if name in team_pages
+    ]
+
+
 def write_club_feed(
     club_name: str,
     club_slug: str,
@@ -1856,6 +2024,7 @@ def write_club_feed(
     generated: str,
     results_unavailable: bool = False,
     extra_participation: list[dict] | None = None,
+    team_pages: dict[str, dict] | None = None,
 ) -> None:
     """Write feeds/clubs/<slug>.json aggregating all teams in a club across leagues.
 
@@ -1908,6 +2077,14 @@ def write_club_feed(
         "results": sorted(safe_club_results, key=lambda x: (x["date"], x["time"]), reverse=True),
         "participation": sorted(club_participation, key=lambda x: (x["date"], x["time"]), reverse=True),
     }
+    linked = _club_team_links(
+        fixture_rows,
+        result_rows,
+        club_participation,
+        team_pages or {},
+    )
+    if linked:
+        payload["teams"] = linked
     out = clubs_dir / f"{club_slug}.json"
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -2048,6 +2225,8 @@ def _run(browser_holder: list) -> int:
     all_team_result_rows: list[dict] = []
     all_team_names: list[str] = []
     all_retained_participation: list[dict] = []
+    # Open-age team name → {team_id, fulltime_url}, for club feeds.
+    team_pages: dict[str, dict] = {}
 
     # Leagues whose results Full-Time refused this run. A club playing in one of
     # them has an incomplete results array, and its feed says so.
@@ -2121,6 +2300,10 @@ def _run(browser_holder: list) -> int:
                     f"{kept_records} participation record(s)"
                 )
                 results_report[-1] = (league_name, f"{results_report[-1][1]} — {note}")
+
+        directory = getattr(fetch_fixtures, "last_directory", EMPTY_DIRECTORY)
+        fixtures = stamp_divisions(fixtures, directory.divisions, season_id)
+        results = stamp_divisions(results, directory.divisions, season_id)
 
         if fixtures and not results and not results_unavailable:
             # Not fatal — a league genuinely has no results before its first
@@ -2212,6 +2395,9 @@ def _run(browser_holder: list) -> int:
         team_index_entries: list[dict] = []
         for team_name in all_teams:
             team_slug_name = slug(team_name)
+            page = team_page_fields(team_name, directory.teams)
+            if page:
+                team_pages[team_name] = page
             write_team_feed(
                 team_name, team_slug_name, league_name, league_slug_name,
                 teams_fixtures.get(team_name, []),
@@ -2219,8 +2405,9 @@ def _run(browser_holder: list) -> int:
                 generated,
                 results_unavailable=results_not_read,
                 extra_participation=retained_participation.get(team_name, []),
+                team_page=page or None,
             )
-            team_index_entries.append({"name": team_name, "slug": team_slug_name})
+            team_index_entries.append({"name": team_name, "slug": team_slug_name, **page})
 
             # Collect enriched dicts for club-level aggregation
             all_team_names.append(team_name)
@@ -2281,6 +2468,7 @@ def _run(browser_holder: list) -> int:
             generated,
             results_unavailable=bool(club_leagues & leagues_without_results),
             extra_participation=extra,
+            team_pages=team_pages,
         )
         teams_in_club = sorted(
             {r["team"] for r in club_fixtures.get(club_name, [])}
