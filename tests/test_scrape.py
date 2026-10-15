@@ -2346,3 +2346,24 @@ def test_merge_results_copies_fixture_id_onto_unlinked_primary():
     assert len(merged) == 1
     assert merged[0].fixture_id == "123"
     assert merged[0].home_score == 1
+
+
+def test_merge_results_keeps_same_day_distinct_fixtures_separate():
+    """Different kick-off or division on the same date must not share a fixture_id."""
+    from scrape import Result, merge_results
+    morning = dict(date="01/09/26", time="10:00", home_team="A", away_team="B",
+                   home_score=1, away_score=0, venue="", division_label="U12")
+    afternoon = dict(date="01/09/26", time="14:00", home_team="A", away_team="B",
+                     home_score=None, away_score=None, venue="", division_label="U12")
+    other_div = dict(date="01/09/26", time="10:00", home_team="A", away_team="B",
+                     home_score=2, away_score=2, venue="", division_label="U13")
+    primary = [Result(**morning), Result(**other_div)]
+    extra = [Result(**afternoon, fixture_id="999"), Result(**morning, fixture_id="111")]
+    merged = merge_results(primary, extra)
+    assert len(merged) == 3
+    by_key = {(r.date, r.time, r.division_label): r for r in merged}
+    assert by_key[("01/09/26", "10:00", "U12")].fixture_id == "111"
+    assert by_key[("01/09/26", "10:00", "U12")].home_score == 1
+    assert by_key[("01/09/26", "14:00", "U12")].fixture_id == "999"
+    assert by_key[("01/09/26", "10:00", "U13")].fixture_id == ""
+    assert by_key[("01/09/26", "10:00", "U13")].home_score == 2

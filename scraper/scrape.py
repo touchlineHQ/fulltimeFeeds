@@ -648,14 +648,18 @@ fetch_results.last_directory = EMPTY_DIRECTORY
 
 
 def merge_results(primary: list[Result], extra: list[Result]) -> list[Result]:
-    """Keep one row per match. Rows in ``primary`` win; ``extra`` only fills gaps."""
+    """Keep one row per match. Rows in ``primary`` win; ``extra`` only fills gaps.
+
+    Same-day double-headers (different kick-off or division) stay separate so a
+    fixture_id is never copied onto the wrong result.
+    """
     merged = list(primary)
     positions = {
-        (row.date, row.home_team, row.away_team): index
+        (row.date, row.time, row.home_team, row.away_team, row.division_label): index
         for index, row in enumerate(merged)
     }
     for result in extra:
-        key = (result.date, result.home_team, result.away_team)
+        key = (result.date, result.time, result.home_team, result.away_team, result.division_label)
         if key in positions:
             index = positions[key]
             if not merged[index].fixture_id and result.fixture_id:
