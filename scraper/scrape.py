@@ -153,6 +153,7 @@ class Fixture(NamedTuple):
     status: str = ""   # Full-Time status notes, e.g. "Postponed" or ""
     division_id: str = ""  # selectedFixtureGroupKey, e.g. "1_106623061"
     table_url: str = ""
+    fixture_id: str = ""  # displayFixture.html?id=, when the row links to one
 
 
 class Result(NamedTuple):
@@ -166,6 +167,7 @@ class Result(NamedTuple):
     division_label: str
     division_id: str = ""
     table_url: str = ""
+    fixture_id: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +251,8 @@ TABLE_URL = (
     "?selectedSeason={season}&selectedFixtureGroupKey={division_id}"
 )
 TEAM_URL = "https://fulltime.thefa.com/displayTeam.html?id={team_id}"
+DISPLAY_FIXTURE_URL = "https://fulltime.thefa.com/displayFixture.html?id={fixture_id}"
+_FIXTURE_HREF_RE = re.compile(r"displayFixture\.html\?id=(\d+)")
 _DIVISION_ID_RE = re.compile(r"^\d+_\d+$")
 _TEAM_ID_RE = re.compile(r"^\d+$")
 _SEASON_ID_RE = re.compile(r"^\d+$")
@@ -644,16 +648,65 @@ fetch_results.last_directory = EMPTY_DIRECTORY
 
 
 def merge_results(primary: list[Result], extra: list[Result]) -> list[Result]:
-    """Keep one row per match. Rows in ``primary`` win; ``extra`` only fills gaps."""
+    """Keep one row per match. Rows in ``primary`` win; ``extra`` only fills gaps.
+
+    Same-day double-headers (different kick-off or division) stay separate so a
+    fixture_id is never copied onto the wrong result.
+    """
     merged = list(primary)
-    seen = {(row.date, row.home_team, row.away_team) for row in merged}
+    positions = {
+        (row.date, row.time, row.home_team, row.away_team, row.division_label): index
+        for index, row in enumerate(merged)
+    }
     for result in extra:
-        key = (result.date, result.home_team, result.away_team)
-        if key in seen:
+        key = (result.date, result.time, result.home_team, result.away_team, result.division_label)
+        if key in positions:
+            index = positions[key]
+            if not merged[index].fixture_id and result.fixture_id:
+                merged[index] = merged[index]._replace(fixture_id=result.fixture_id)
             continue
-        seen.add(key)
+        positions[key] = len(merged)
         merged.append(result)
     return merged
+
+
+def _fixture_id_from(node) -> str:
+    """The displayFixture.html id linked from a match row, or nothing."""
+    if node is None:
+        return ""
+    link = node.find("a", href=_FIXTURE_HREF_RE)
+    if link is None:
+        return ""
+    match = _FIXTURE_HREF_RE.search(link.get("href") or "")
+    return match.group(1) if match else ""
+
+
+def _public_match_id(
+    fixture_id: str, date: str, home: str, away: str, time: str = "", division: str = "",
+) -> str:
+    """Prefer Full-Time's own fixture id. Fall back to a hash when a row has no link.
+
+    The hash covers kick-off and division as well as the teams, so two unlinked
+    matches between the same sides on one day get distinct ids. Calendar event
+    ids use ``_match_id`` and are unaffected.
+    """
+    if fixture_id:
+        return fixture_id
+    return hashlib.md5(f"{date}|{time}|{home}|{away}|{division}".encode()).hexdigest()
+
+
+def _published_fixture_id(row: dict) -> str:
+    """A Full-Time fixture id already written on a feed row, or nothing.
+
+    A 32-character hash is our own id, not theirs, and must not be treated as one.
+    """
+    match = _FIXTURE_HREF_RE.search(row.get("fixture_url") or "")
+    if match:
+        return match.group(1)
+    raw = str(row.get("id") or "")
+    if raw.isdigit():
+        return raw
+    return ""
 
 
 def _find_fixture_table(soup: BeautifulSoup, context: str) -> object | None:
@@ -765,6 +818,7 @@ def parse_fixture_page(html: str) -> tuple[list[Fixture], list[Result]]:
                 away_score=score[1],
                 venue=venue,
                 division_label=competition or "Unknown Division",
+                fixture_id=_fixture_id_from(row),
             ))
             continue
 
@@ -776,6 +830,7 @@ def parse_fixture_page(html: str) -> tuple[list[Fixture], list[Result]]:
             venue=venue,
             division_label=competition or "Unknown Division",
             status=status,
+            fixture_id=_fixture_id_from(row),
         ))
 
     log.info(f"  Found {len(fixtures)} fixtures ({len(played)} already played)")
@@ -983,7 +1038,15 @@ def parse_results(html: str) -> list[Result]:
         if not date_str:
             continue
 
-        key = f"{date_str}|{home}|{away}"
+        fixture_id = (
+            _fixture_id_from(row)
+            or _fixture_id_from(home_cell)
+            or _fixture_id_from(away_cell)
+        )
+        key = (
+            f"id|{fixture_id}" if fixture_id
+            else f"{date_str}|{time_str}|{home}|{away}|{competition}"
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -997,6 +1060,7 @@ def parse_results(html: str) -> list[Result]:
             away_score=away_score,
             venue=venue,
             division_label=competition or "Unknown Division",
+            fixture_id=fixture_id,
         ))
 
     log.info(f"  Found {len(results)} results")
@@ -1263,7 +1327,10 @@ def fixture_to_iso_date(date_str: str) -> str:
 def fixture_to_dict(fixture: Fixture) -> dict:
     """Serialise a Fixture to a plain dict for JSON output."""
     row = {
-        "id": _match_id(fixture.date, fixture.home_team, fixture.away_team),
+        "id": _public_match_id(
+            fixture.fixture_id, fixture.date, fixture.home_team, fixture.away_team,
+            fixture.time or "10:00", fixture.division_label,
+        ),
         "date": fixture_to_iso_date(fixture.date),
         "time": fixture.time or "10:00",
         "home_team": fixture.home_team,
@@ -1271,6 +1338,8 @@ def fixture_to_dict(fixture: Fixture) -> dict:
         "venue": fixture.venue,
         "division": fixture.division_label,
     }
+    if fixture.fixture_id:
+        row["fixture_url"] = DISPLAY_FIXTURE_URL.format(fixture_id=fixture.fixture_id)
     if fixture.division_id:
         row["division_id"] = fixture.division_id
         row["table_url"] = fixture.table_url
@@ -1280,7 +1349,10 @@ def fixture_to_dict(fixture: Fixture) -> dict:
 def result_to_dict(result: Result) -> dict:
     """Serialise a Result to a plain dict for JSON output."""
     row = {
-        "id": _match_id(result.date, result.home_team, result.away_team),
+        "id": _public_match_id(
+            result.fixture_id, result.date, result.home_team, result.away_team,
+            result.time or "10:00", result.division_label,
+        ),
         "date": fixture_to_iso_date(result.date),
         "time": result.time or "10:00",
         "home_team": result.home_team,
@@ -1290,6 +1362,8 @@ def result_to_dict(result: Result) -> dict:
         "venue": result.venue,
         "division": result.division_label,
     }
+    if result.fixture_id:
+        row["fixture_url"] = DISPLAY_FIXTURE_URL.format(fixture_id=result.fixture_id)
     if result.division_id:
         row["division_id"] = result.division_id
         row["table_url"] = result.table_url
@@ -1320,6 +1394,7 @@ def result_from_published(row: dict) -> Result | None:
         division_label=row.get("division") or "",
         division_id=row.get("division_id") or "",
         table_url=row.get("table_url") or "",
+        fixture_id=_published_fixture_id(row),
     )
 
 
@@ -1412,12 +1487,43 @@ def drop_settled_fixtures(
 
     Full-Time keeps a played match on its fixtures page while the league enters
     the score, and in some competitions after that too, so the same match
-    arrives from both pages.  Fixture and result IDs are built from the same
-    key (date and both team names), so a settled match is recognisable and is
-    listed as a result only.
+    arrives from both pages.  A settled match is recognised by its id or by its
+    date, kick-off, both team names and division, and is listed as a result only.
     """
-    played = {row["id"] for row in result_rows if row.get("id")}
-    return [row for row in fixture_rows if row.get("id") not in played]
+    # Only a Full-Time fixture id settles a fixture on its own. A hash id must
+    # also match on the complete key below.
+    played = {_published_fixture_id(row) for row in result_rows} - {""}
+    # An id is Full-Time's fixture id only when the row linked to one, so the
+    # fixture and its result can carry different ids. Match on the teams too.
+    # When either side has no fixture link its id is our hash, so match on
+    # date, kick-off, teams and division instead. Two linked rows are compared
+    # by id alone.
+    all_keys = {_settled_key(row) for row in result_rows} - {None}
+    unlinked_keys = {
+        _settled_key(row) for row in result_rows if not row.get("fixture_url")
+    } - {None}
+    out = []
+    for row in fixture_rows:
+        if _published_fixture_id(row) in played:
+            continue
+        key = _settled_key(row)
+        if key in (all_keys if not row.get("fixture_url") else unlinked_keys):
+            continue
+        out.append(row)
+    return out
+
+
+def _settled_key(row: dict) -> tuple | None:
+    # Kick-off and division as well as the teams: two matches between the same
+    # sides on one day, in different competitions, must not settle each other.
+    key = (
+        row.get("date"),
+        row.get("time"),
+        row.get("home_team"),
+        row.get("away_team"),
+        row.get("division"),
+    )
+    return key if all(key) else None
 
 
 def scheduled_fixtures(

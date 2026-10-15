@@ -666,7 +666,7 @@ class TestConsolidateMatches:
 class TestDropSettledFixtures:
 
     def test_fixture_with_a_result_is_dropped(self):
-        fixtures = [_row("m1", "East Leake Robins", "home"), _row("m2", "East Leake Robins", "away")]
+        fixtures = [_row("m1", "East Leake Robins", "home"), _row("m2", "East Leake Robins", "away", date="2026-10-18")]
         results = [_row("m1", "East Leake Robins", "home", home_score=3, away_score=1)]
 
         out = scrape.drop_settled_fixtures(fixtures, results)
@@ -1996,6 +1996,88 @@ class TestCalledOffStatus:
         assert scored["East Leake Bantams Green U12"] == (3, 2)
         assert scored["East Leake Bantams U10"] == (None, None)
 
+    def test_the_match_link_is_the_fulltime_fixture_id(self):
+        html = """
+        <table><tr><td>Home Team</td></tr>
+        <tr>
+          <td class="left cell-divider">18/10/26 10:00</td>
+          <td class="home-team"><a href="/displayFixture.html?id=31015803">East Leake Bantams Green^ U12</a></td>
+          <td class="score">VS</td>
+          <td class="road-team"><a href="/displayFixture.html?id=31015803">Eastwood Athletic Blazers U12</a></td>
+          <td class="left cell-divider">Costock Road LE12 6LY</td>
+          <td class="left cell-divider">U12 Sunday</td>
+          <td class="status-notes"></td>
+        </tr></table>
+        """
+
+        fixtures, _played = scrape.parse_fixture_page(html)
+        row = scrape.fixture_to_dict(fixtures[0])
+
+        assert fixtures[0].fixture_id == "31015803"
+        assert row["id"] == "31015803"
+        assert row["fixture_url"] == "https://fulltime.thefa.com/displayFixture.html?id=31015803"
+
+    def test_a_linked_fixture_is_settled_by_an_unlinked_result(self):
+        fixture = scrape.fixture_to_dict(Fixture(
+            "18/10/26", "10:00", "Home U12", "Away U12",
+            "Ground", "U12 Sunday", fixture_id="31015803",
+        ))
+        result = scrape.result_to_dict(scrape.Result(
+            "18/10/26", "10:00", "Home U12", "Away U12", 2, 1,
+            "Ground", "U12 Sunday",
+        ))
+        assert fixture["id"] != result["id"]
+
+        assert scrape.drop_settled_fixtures([fixture], [result]) == []
+
+    def test_an_unlinked_result_in_another_competition_does_not_settle_a_fixture(self):
+        fixture = scrape.fixture_to_dict(Fixture(
+            "18/10/26", "10:00", "Home U12", "Away U12",
+            "Ground", "U12 Sunday", fixture_id="31015803",
+        ))
+        other_cup = scrape.result_to_dict(scrape.Result(
+            "18/10/26", "10:00", "Home U12", "Away U12", 2, 1,
+            "Ground", "U12 Cup",
+        ))
+        other_kickoff = scrape.result_to_dict(scrape.Result(
+            "18/10/26", "14:00", "Home U12", "Away U12", 2, 1,
+            "Ground", "U12 Sunday",
+        ))
+
+        assert scrape.drop_settled_fixtures([fixture], [other_cup, other_kickoff]) == [fixture]
+
+    def test_a_result_link_only_in_the_away_cell_is_the_fixture_id(self):
+        # Home and road cells in separate containers: the row the parser keeps
+        # is the home cell's, so the link has to be read from the away cell.
+        html = """
+        <div id="results">
+          <div class="r"><span>18/10/26 10:00</span><span class="home-team">Home U12</span><span class="score">2 - 1</span></div>
+          <span class="road-team"><a href="/displayFixture.html?id=31015803">Away U12</a></span>
+          <span class="comp">U12 Sunday</span><span class="status-notes"></span>
+          <div class="r"><span>19/10/26 10:00</span><span class="home-team">Other U12</span><span class="score">0 - 0</span></div>
+          <span class="road-team">Rival U12</span>
+          <span class="comp">U12 Sunday</span><span class="status-notes"></span>
+        </div>
+        """
+
+        results = scrape.parse_results(html)
+
+        assert results[0].home_team == "Home U12"
+        assert results[0].fixture_id == "31015803"
+        assert results[1].fixture_id == ""
+
+    def test_a_restricted_match_does_not_publish_the_fulltime_fixture(self):
+        from compliance import redact_fixture
+
+        row = scrape.fixture_to_dict(Fixture(
+            "18/10/26", "10:00", "East Leake U8", "Other U8",
+            "Ground", "U8 Sunday", fixture_id="31015803",
+        ))
+        safe = redact_fixture(row, "East Leake U8")
+
+        assert safe["id"] != "31015803"
+        assert "fixture_url" not in safe
+
     def test_results_use_the_url_the_cron_was_already_fetching(self, monkeypatch):
         seen = []
 
@@ -2252,3 +2334,51 @@ class TestCalendarKeepsHistory:
         assert all("Attenborough" not in row["opponent"] for row in feed["fixtures"])
         assert any(row["opponent"] == "Heanor Town Hurricanes U12" for row in feed["fixtures"])
 
+
+
+def test_merge_results_copies_fixture_id_onto_unlinked_primary():
+    from scrape import Result, merge_results
+    base = dict(date="01/09/26", time="10:00", home_team="A", away_team="B",
+                home_score=1, away_score=0, venue="", division_label="D")
+    primary = [Result(**base)]
+    extra = [Result(**base, fixture_id="123")]
+    merged = merge_results(primary, extra)
+    assert len(merged) == 1
+    assert merged[0].fixture_id == "123"
+    assert merged[0].home_score == 1
+
+
+def test_merge_results_keeps_same_day_distinct_fixtures_separate():
+    """Different kick-off or division on the same date must not share a fixture_id."""
+    from scrape import Result, merge_results
+    morning = dict(date="01/09/26", time="10:00", home_team="A", away_team="B",
+                   home_score=1, away_score=0, venue="", division_label="U12")
+    afternoon = dict(date="01/09/26", time="14:00", home_team="A", away_team="B",
+                     home_score=None, away_score=None, venue="", division_label="U12")
+    other_div = dict(date="01/09/26", time="10:00", home_team="A", away_team="B",
+                     home_score=2, away_score=2, venue="", division_label="U13")
+    primary = [Result(**morning), Result(**other_div)]
+    extra = [Result(**afternoon, fixture_id="999"), Result(**morning, fixture_id="111")]
+    merged = merge_results(primary, extra)
+    assert len(merged) == 3
+    by_key = {(r.date, r.time, r.division_label): r for r in merged}
+    assert by_key[("01/09/26", "10:00", "U12")].fixture_id == "111"
+    assert by_key[("01/09/26", "10:00", "U12")].home_score == 1
+    assert by_key[("01/09/26", "14:00", "U12")].fixture_id == "999"
+    assert by_key[("01/09/26", "10:00", "U13")].fixture_id == ""
+    assert by_key[("01/09/26", "10:00", "U13")].home_score == 2
+
+
+def test_unlinked_ids_differ_by_kickoff_and_division():
+    from scrape import _public_match_id, drop_settled_fixtures
+    a = _public_match_id("", "2026-10-18", "A", "B", "10:00", "U12 League")
+    b = _public_match_id("", "2026-10-18", "A", "B", "14:00", "U12 League")
+    c = _public_match_id("", "2026-10-18", "A", "B", "10:00", "U12 Cup")
+    assert len({a, b, c}) == 3
+    assert _public_match_id("123", "2026-10-18", "A", "B", "10:00", "x") == "123"
+    base = {"date": "2026-10-18", "home_team": "A", "away_team": "B", "division": "U12 League"}
+    fixtures = [dict(base, id=b, time="14:00")]
+    # A hash id on a result only settles a fixture with the complete key.
+    results = [dict(base, id=b, time="10:00")]
+    assert drop_settled_fixtures(fixtures, results) == fixtures
+    assert drop_settled_fixtures(fixtures, [dict(base, id="x", time="14:00")]) == []

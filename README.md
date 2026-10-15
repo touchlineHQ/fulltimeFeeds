@@ -82,13 +82,14 @@ Fixture (in `fixtures.json` and `fixtures` arrays):
 
 ```json
 {
-  "id": "481ab77102acbc3a91144ddcffc10c26",
+  "id": "31015803",
   "date": "2026-03-22",
   "time": "10:00",
   "home_team": "Arnold Town Blue U13",
   "away_team": "Opponent FC U13",
   "venue": "The Ground",
   "division": "U13 Division 1",
+  "fixture_url": "https://fulltime.thefa.com/displayFixture.html?id=31015803",
   "division_id": "1_106623061",
   "table_url": "https://fulltime.thefa.com/table.html?selectedSeason=876713597&selectedFixtureGroupKey=1_106623061"
 }
@@ -98,7 +99,7 @@ Result (in `results.json` and `results` arrays):
 
 ```json
 {
-  "id": "...",
+  "id": "31015803",
   "date": "2026-03-15",
   "time": "10:00",
   "home_team": "Arnold Town Blue U13",
@@ -107,6 +108,7 @@ Result (in `results.json` and `results` arrays):
   "away_score": 1,
   "venue": "The Ground",
   "division": "U13 Division 1",
+  "fixture_url": "https://fulltime.thefa.com/displayFixture.html?id=31015803",
   "division_id": "1_106623061",
   "table_url": "https://fulltime.thefa.com/table.html?selectedSeason=876713597&selectedFixtureGroupKey=1_106623061"
 }
@@ -116,7 +118,7 @@ Team and club feeds additionally include `league`, `team`, `home_away` (`"home"`
 
 Slugs are the path to another feed. A team feed carries `team_slug`, `league_slug`, `club` and `club_slug` once at the top because every row is that team in that league. An open-age row may also include `opponent_slug` when that opponent has a published team feed. A league feed carries `league_slug` at the top; each row may include `home_team_slug` and `away_team_slug` when those sides have published team feeds, and `home_club_slug` / `away_club_slug` when those clubs have feeds. A club feed carries `club_slug` at the top and a `teams` array of `{name, team_slug, league, league_slug}` (plus `team_id` and `fulltime_url` when those exist). Its match rows repeat `team_slug` and `league_slug` because the file mixes both. `teams.json` uses the existing `slug` for the team and adds `club` and `club_slug`. The index's club entries add `league_slug`. Join them up as `feeds/<league_slug>/teams/<team_slug>.json` and `feeds/clubs/<club_slug>.json`. When a published-feed mapping is supplied (the normal scrape and demo paths), a team slug is only written when that exact feed exists, so a team with no feed of its own keeps its name but has no slug. Direct writer helpers used in unit tests may still emit a derived slug without that mapping.
 
-`division_id` and `table_url` are present only when the division is a league table Full-Time publishes. Cup ties are left out, and so is anything at U11 or below. The id is the fixture-group key from the fixtures page (`1_106623061` for U14 Sunday), not the league id.
+`id` is Full-Time's own fixture id when the row links to `displayFixture.html?id=`, and `fixture_url` is that match page. A row with no such link gets a hash of its date, kick-off, both teams and division, so two unlinked matches between the same sides on one day get different ids. That hash replaces the earlier date-and-teams hash, so an unlinked row's `id` changes once. U11 and below publish neither the Full-Time id nor `fixture_url`, because that page names the opposition; those rows keep an `id`, but it is a restricted record id of their own. `division_id` and `table_url` are present only when the division is a league table Full-Time publishes. Cup ties are left out of those, and so is anything at U11 or below. The division id is the fixture-group key (`1_106623061` for U14 Sunday), not the match id.
 
 An open-age team feed also has `team_id` and `fulltime_url` (`displayTeam.html?id=`). `teams.json`, the index, and a club feed's `teams` array carry the same pair. U11 and below do not, for now.
 
@@ -146,8 +148,7 @@ place:
 - **Participation stays per team.** A derby at U11 or below produces a
   participation record for each of the club's teams: both of them played.
 
-`id` is stable across the fixtures and results pages (it is derived from the
-date and both team names), so consumers can key on it.
+`id` is the same on the fixtures and results pages when both link to the same Full-Time match. If only one of them has the link, one row carries Full-Time's id and the other the hash, so `id` alone is not a reliable join between the two pages; the feeds settle that case by date, kick-off, teams and division. Calendars keep their existing event ids, so a subscription does not gain a second copy of each match.
 
 ### Publication rules for U11 and below
 
