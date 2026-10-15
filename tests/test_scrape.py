@@ -666,7 +666,7 @@ class TestConsolidateMatches:
 class TestDropSettledFixtures:
 
     def test_fixture_with_a_result_is_dropped(self):
-        fixtures = [_row("m1", "East Leake Robins", "home"), _row("m2", "East Leake Robins", "away")]
+        fixtures = [_row("m1", "East Leake Robins", "home"), _row("m2", "East Leake Robins", "away", date="2026-10-18")]
         results = [_row("m1", "East Leake Robins", "home", home_score=3, away_score=1)]
 
         out = scrape.drop_settled_fixtures(fixtures, results)
@@ -1869,6 +1869,19 @@ class TestCalledOffStatus:
         assert fixtures[0].fixture_id == "31015803"
         assert row["id"] == "31015803"
         assert row["fixture_url"] == "https://fulltime.thefa.com/displayFixture.html?id=31015803"
+
+    def test_a_linked_fixture_is_settled_by_an_unlinked_result(self):
+        fixture = scrape.fixture_to_dict(Fixture(
+            "18/10/26", "10:00", "Home U12", "Away U12",
+            "Ground", "U12 Sunday", fixture_id="31015803",
+        ))
+        result = scrape.result_to_dict(scrape.Result(
+            "18/10/26", "10:00", "Home U12", "Away U12", 2, 1,
+            "Ground", "U12 Sunday",
+        ))
+        assert fixture["id"] != result["id"]
+
+        assert scrape.drop_settled_fixtures([fixture], [result]) == []
 
     def test_a_restricted_match_does_not_publish_the_fulltime_fixture(self):
         from compliance import redact_fixture

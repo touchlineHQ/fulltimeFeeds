@@ -1409,12 +1409,32 @@ def drop_settled_fixtures(
 
     Full-Time keeps a played match on its fixtures page while the league enters
     the score, and in some competitions after that too, so the same match
-    arrives from both pages.  Fixture and result IDs are built from the same
-    key (date and both team names), so a settled match is recognisable and is
-    listed as a result only.
+    arrives from both pages.  A settled match is recognised by its id or by its
+    date and both team names, and is listed as a result only.
     """
     played = {row["id"] for row in result_rows if row.get("id")}
-    return [row for row in fixture_rows if row.get("id") not in played]
+    # An id is Full-Time's fixture id only when the row linked to one, so the
+    # fixture and its result can carry different ids. Match on the teams too.
+    # When either side has no fixture link its id is our hash, so match on
+    # date and teams instead. Two linked rows are compared by id alone.
+    all_keys = {_settled_key(row) for row in result_rows} - {None}
+    unlinked_keys = {
+        _settled_key(row) for row in result_rows if not row.get("fixture_url")
+    } - {None}
+    out = []
+    for row in fixture_rows:
+        if row.get("id") in played:
+            continue
+        key = _settled_key(row)
+        if key in (all_keys if not row.get("fixture_url") else unlinked_keys):
+            continue
+        out.append(row)
+    return out
+
+
+def _settled_key(row: dict) -> tuple | None:
+    key = (row.get("date"), row.get("home_team"), row.get("away_team"))
+    return key if all(key) else None
 
 
 def scheduled_fixtures(
