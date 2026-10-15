@@ -728,6 +728,22 @@ class TestWriteClubFeed:
         assert payload["fixtures"][0]["derby"] is True
         assert payload["fixtures"][0]["team"] == "East Leake Robins"
 
+    def test_a_restricted_fixture_does_not_slug_the_opposition(self, tmp_path, monkeypatch):
+        fixtures = [
+            _row("m1", "East Leake U10", "home",
+                 home_team="East Leake U10", away_team="Other U10",
+                 opponent="Other U10", division="U10 Sunday"),
+        ]
+
+        payload = self._write(tmp_path, monkeypatch, fixtures, [])
+        fixture = payload["fixtures"][0]
+
+        assert fixture["away_team"] == "Opposition"
+        assert fixture["team_slug"] == "east-leake-u10"
+        assert fixture["home_team_slug"] == "east-leake-u10"
+        assert "opponent_slug" not in fixture
+        assert "away_team_slug" not in fixture
+
     def test_played_match_appears_only_in_results(self, tmp_path, monkeypatch):
         played = _row(
             "m1", "East Leake Robins", "home",
@@ -1098,6 +1114,8 @@ class TestFullTimeLinks:
         }
         assert payload["team_id"] == "948523730"
         assert payload["fulltime_url"] == page["fulltime_url"]
+        assert payload["team_slug"] == "east-leake-bantams-green-u12"
+        assert payload["league_slug"] == "yel-sunday"
         assert scrape.team_page_fields("AJ Sport Black U8", teams) == {}
 
     def test_team_in_restricted_division_gets_no_team_page(self):
@@ -1114,8 +1132,10 @@ class TestFullTimeLinks:
             "date": "2026-10-11",
             "time": "10:00",
             "team": "East Leake Bantams Green^ U12",
+            "league": "YEL East Midlands Sunday 26/27",
             "home_team": "East Leake Bantams Green^ U12",
             "away_team": "Arnold Town Maroon U12",
+            "opponent": "Arnold Town Maroon U12",
             "home_away": "home",
             "division": "U12 Sunday",
         }
@@ -1130,11 +1150,138 @@ class TestFullTimeLinks:
         )
         payload = json.loads((tmp_path / "feeds" / "clubs" / "east-leake.json").read_text())
 
+        assert payload["club_slug"] == "east-leake"
         assert payload["teams"] == [{
             "name": "East Leake Bantams Green^ U12",
+            "team_slug": "east-leake-bantams-green-u12",
+            "league": "YEL East Midlands Sunday 26/27",
+            "league_slug": "yel-east-midlands-sunday-26-27",
             "team_id": "948523730",
             "fulltime_url": "https://fulltime.thefa.com/displayTeam.html?id=948523730",
         }]
+        fixture = payload["fixtures"][0]
+        assert fixture["team_slug"] == "east-leake-bantams-green-u12"
+        assert fixture["league_slug"] == "yel-east-midlands-sunday-26-27"
+        assert fixture["opponent_slug"] == "arnold-town-maroon-u12"
+        assert "opponent_slug" not in payload["teams"][0]
+
+    def test_team_feed_puts_its_own_slugs_at_the_top(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        scrape.write_team_feed(
+            "East Leake Robins", "east-leake-robins", "YEL Sunday", "yel-sunday",
+            [scrape.Fixture(
+                "11/10/26", "10:00", "East Leake Robins", "Awsworth Villa",
+                "Ground", "Division One",
+            )],
+            [],
+            "2026-10-14T12:00:00Z",
+        )
+        payload = json.loads(
+            (tmp_path / "feeds" / "yel-sunday" / "teams" / "east-leake-robins.json").read_text()
+        )
+        row = payload["fixtures"][0]
+
+        assert payload["team_slug"] == "east-leake-robins"
+        assert payload["league_slug"] == "yel-sunday"
+        assert "team_slug" not in row
+        assert "league_slug" not in row
+        assert row["opponent_slug"] == "awsworth-villa"
+
+    def test_league_feed_slugs_both_sides(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        scrape.write_league_feed(
+            "YEL Sunday", "yel-sunday",
+            [scrape.Fixture(
+                "11/10/26", "10:00", "East Leake Robins", "Awsworth Villa",
+                "Ground", "Division One",
+            )],
+            [],
+            "2026-10-14T12:00:00Z",
+        )
+        payload = json.loads((tmp_path / "feeds" / "yel-sunday" / "fixtures.json").read_text())
+        row = payload["fixtures"][0]
+
+        assert payload["league_slug"] == "yel-sunday"
+        assert row["home_team_slug"] == "east-leake-robins"
+        assert row["away_team_slug"] == "awsworth-villa"
+        assert "team_slug" not in row
+
+    def test_club_feed_only_links_team_feeds_written_in_that_league(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(scrape, "FEEDS_DIR", tmp_path / "feeds")
+        row = {
+            "id": "abc",
+            "date": "2026-10-11",
+            "time": "10:00",
+            "team": "East Leake Robins",
+            "league": "YEL Sunday",
+            "home_team": "East Leake Robins",
+            "away_team": "Awsworth Villa",
+            "opponent": "Awsworth Villa",
+            "home_away": "home",
+            "division": "Division One",
+        }
+        # Awsworth Villa has a feed, but in another league.
+        scrape.write_club_feed(
+            "East Leake", "east-leake", [row], [], "2026-10-14T12:00:00Z",
+            team_feeds={
+                "YEL Sunday": {"East Leake Robins": "east-leake-robins"},
+                "YEL Saturday": {"Awsworth Villa": "awsworth-villa"},
+            },
+        )
+        payload = json.loads((tmp_path / "feeds" / "clubs" / "east-leake.json").read_text())
+        fixture = payload["fixtures"][0]
+
+        assert fixture["team_slug"] == "east-leake-robins"
+        assert fixture["home_team_slug"] == "east-leake-robins"
+        assert "opponent_slug" not in fixture
+        assert "away_team_slug" not in fixture
+        assert payload["teams"][0]["team_slug"] == "east-leake-robins"
+
+    def test_club_directory_omits_team_slug_without_a_written_feed(self):
+        teams = scrape.club_team_directory(
+            [{"team": "East Leake Robins", "league": "YEL Sunday"}],
+            team_feeds={"YEL Saturday": {"East Leake Robins": "east-leake-robins"}},
+        )
+        assert teams == [{
+            "name": "East Leake Robins",
+            "league": "YEL Sunday",
+            "league_slug": "yel-sunday",
+        }]
+
+    def test_demo_feed_links_resolve_to_files_that_exist(self, tmp_path, monkeypatch):
+        import demo
+
+        feeds = tmp_path / "feeds"
+        monkeypatch.setattr(demo, "FEEDS_DIR", feeds)
+        monkeypatch.setattr(demo, "write_index", lambda **kwargs: None)
+        demo.generate(datetime(2026, 10, 14).date())
+
+        league_dir = feeds / demo.LEAGUE_SLUG
+        teams_dir = league_dir / "teams"
+        published = {path.stem for path in teams_dir.glob("*.json")}
+
+        def linked(rows):
+            for row in rows:
+                for field in ("team_slug", "opponent_slug", "home_team_slug", "away_team_slug"):
+                    if field in row:
+                        yield row[field]
+
+        slugs: list[str] = []
+        for path in teams_dir.glob("*.json"):
+            payload = json.loads(path.read_text())
+            slugs.extend(linked([*payload["fixtures"], *payload["results"]]))
+        club = json.loads((feeds / "clubs" / f"{demo.CLUB_SLUG}.json").read_text())
+        slugs.extend(linked([*club["fixtures"], *club["results"], *club["participation"]]))
+        slugs.extend(linked(club["teams"]))
+        for name in ("fixtures", "results"):
+            payload = json.loads((league_dir / f"{name}.json").read_text())
+            slugs.extend(linked(payload[name]))
+
+        assert slugs
+        assert set(slugs) <= published
+        assert "demo-fc-seniors" in slugs
+        seniors = next(t for t in club["teams"] if t["name"] == "Demo FC")
+        assert seniors["team_slug"] == "demo-fc-seniors"
 
     def test_fixtures_request_asks_for_every_age_group(self, monkeypatch):
         seen = []
