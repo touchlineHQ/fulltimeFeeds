@@ -650,12 +650,18 @@ fetch_results.last_directory = EMPTY_DIRECTORY
 def merge_results(primary: list[Result], extra: list[Result]) -> list[Result]:
     """Keep one row per match. Rows in ``primary`` win; ``extra`` only fills gaps."""
     merged = list(primary)
-    seen = {(row.date, row.home_team, row.away_team) for row in merged}
+    positions = {
+        (row.date, row.home_team, row.away_team): index
+        for index, row in enumerate(merged)
+    }
     for result in extra:
         key = (result.date, result.home_team, result.away_team)
-        if key in seen:
+        if key in positions:
+            index = positions[key]
+            if not merged[index].fixture_id and result.fixture_id:
+                merged[index] = merged[index]._replace(fixture_id=result.fixture_id)
             continue
-        seen.add(key)
+        positions[key] = len(merged)
         merged.append(result)
     return merged
 
@@ -1019,7 +1025,15 @@ def parse_results(html: str) -> list[Result]:
         if not date_str:
             continue
 
-        key = f"{date_str}|{home}|{away}"
+        fixture_id = (
+            _fixture_id_from(row)
+            or _fixture_id_from(home_cell)
+            or _fixture_id_from(away_cell)
+        )
+        key = (
+            f"id|{fixture_id}" if fixture_id
+            else f"{date_str}|{time_str}|{home}|{away}|{competition}"
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -1033,11 +1047,7 @@ def parse_results(html: str) -> list[Result]:
             away_score=away_score,
             venue=venue,
             division_label=competition or "Unknown Division",
-            fixture_id=(
-                _fixture_id_from(row)
-                or _fixture_id_from(home_cell)
-                or _fixture_id_from(away_cell)
-            ),
+            fixture_id=fixture_id,
         ))
 
     log.info(f"  Found {len(results)} results")

@@ -2334,3 +2334,15 @@ class TestCalendarKeepsHistory:
         assert all("Attenborough" not in row["opponent"] for row in feed["fixtures"])
         assert any(row["opponent"] == "Heanor Town Hurricanes U12" for row in feed["fixtures"])
 
+
+
+def test_merge_results_copies_fixture_id_onto_unlinked_primary():
+    from scrape import Result, merge_results
+    base = dict(date="01/09/26", time="10:00", home_team="A", away_team="B",
+                home_score=1, away_score=0, venue="", division_label="D")
+    primary = [Result(**base)]
+    extra = [Result(**base, fixture_id="123")]
+    merged = merge_results(primary, extra)
+    assert len(merged) == 1
+    assert merged[0].fixture_id == "123"
+    assert merged[0].home_score == 1
