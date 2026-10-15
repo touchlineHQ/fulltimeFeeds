@@ -1569,6 +1569,112 @@ class TestFetchResultsFromSavedPage:
         assert len(results) == 2
         assert "saved page" in scrape.LAST_SOURCE
 
+    def test_a_saved_page_keeps_the_division_and_team_dropdowns(self, tmp_path, monkeypatch):
+        # The rendered page is what was saved. The fixtures download does not
+        # carry these selects, so the ids have to come from here.
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        path = _saved_page(tmp_path, "918978398", rows=1)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "</body>",
+                """
+                <select id="form1_selectedFixtureGroupKey">
+                  <option value>All</option>
+                  <option value="1_106623061">Division One</option>
+                </select>
+                <select id="form1_selectedTeam">
+                  <option value>All</option>
+                  <option value="948523730">East Leake Robins</option>
+                </select>
+                </body>
+                """,
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: BLOCK)
+
+        results = scrape.fetch_results("918978398", "Euro Soccer", browser=None)
+
+        assert len(results) == 1
+        assert scrape.fetch_results.last_directory.divisions["division one"] == "1_106623061"
+        assert scrape.fetch_results.last_directory.teams["east leake robins"] == "948523730"
+        stamped = scrape.stamp_divisions(results, scrape.fetch_results.last_directory.divisions, "918978398")
+        assert stamped[0].division_id == "1_106623061"
+        assert stamped[0].table_url.endswith("selectedFixtureGroupKey=1_106623061")
+
+    def test_a_live_page_without_dropdowns_takes_ids_from_a_saved_page(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        path = _saved_page(tmp_path, "918978398", rows=1)
+        live = path.read_text(encoding="utf-8")
+        path.write_text(
+            live.replace(
+                "</body>",
+                '<select id="form1_selectedFixtureGroupKey"><option value>All</option>'
+                '<option value="1_106623061">Division One</option></select></body>',
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: live)
+
+        results = scrape.fetch_results("918978398", "Euro Soccer", browser=None)
+
+        assert len(results) == 1
+        assert scrape.LAST_SOURCE == "a plain fetch"
+        assert scrape.fetch_results.last_directory.divisions["division one"] == "1_106623061"
+
+    def test_a_live_page_missing_team_ids_takes_them_from_a_saved_page(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        path = _saved_page(tmp_path, "918978398", rows=1)
+        page = path.read_text(encoding="utf-8")
+        live = page.replace(
+            "</body>",
+            '<select id="form1_selectedFixtureGroupKey"><option value>All</option>'
+            '<option value="1_222222222">Division One</option></select></body>',
+        )
+        path.write_text(
+            page.replace(
+                "</body>",
+                '<select id="form1_selectedFixtureGroupKey"><option value>All</option>'
+                '<option value="1_106623061">Division One</option></select>'
+                '<select id="form1_selectedTeam"><option value>All</option>'
+                '<option value="948523730">East Leake Robins</option></select></body>',
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: live)
+
+        scrape.fetch_results("918978398", "Euro Soccer", browser=None)
+
+        directory = scrape.fetch_results.last_directory
+        assert directory.divisions["division one"] == "1_222222222"
+        assert directory.teams["east leake robins"] == "948523730"
+
+    def test_a_live_page_with_some_divisions_keeps_the_saved_ones_too(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
+        path = _saved_page(tmp_path, "918978398", rows=1)
+        page = path.read_text(encoding="utf-8")
+        live = page.replace(
+            "</body>",
+            '<select id="form1_selectedFixtureGroupKey"><option value>All</option>'
+            '<option value="1_222222222">Division One</option></select></body>',
+        )
+        path.write_text(
+            page.replace(
+                "</body>",
+                '<select id="form1_selectedFixtureGroupKey"><option value>All</option>'
+                '<option value="1_106623061">Division One</option>'
+                '<option value="1_333333333">Division Two</option></select></body>',
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(scrape, "_fetch_page", lambda url, label: live)
+
+        scrape.fetch_results("918978398", "Euro Soccer", browser=None)
+
+        divisions = scrape.fetch_results.last_directory.divisions
+        assert divisions["division one"] == "1_222222222"
+        assert divisions["division two"] == "1_333333333"
+
     def test_a_working_fetch_is_preferred_over_a_saved_page(self, tmp_path, monkeypatch):
         # A saved page is a fallback, not a cache: live data is fresher.
         monkeypatch.setenv(scrape.RESULTS_HTML_DIR_ENV, str(tmp_path))
