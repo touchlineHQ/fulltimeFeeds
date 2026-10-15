@@ -138,6 +138,9 @@ def redact_fixture(row: dict, subject_team: str | None = None) -> dict:
     # result row by mistake.
     for score_field in ("home_score", "away_score", "goals_for", "goals_against"):
         out.pop(score_field, None)
+    # The match page names both teams. A restricted row must not point at it,
+    # and must not keep Full-Time's fixture id for the same reason.
+    out.pop("fixture_url", None)
 
     if "id" in out:
         out["id"] = restricted_record_id(out, subject_team, "fixture")

@@ -1849,6 +1849,39 @@ class TestCalledOffStatus:
         assert scored["East Leake Bantams Green U12"] == (3, 2)
         assert scored["East Leake Bantams U10"] == (None, None)
 
+    def test_the_match_link_is_the_fulltime_fixture_id(self):
+        html = """
+        <table><tr><td>Home Team</td></tr>
+        <tr>
+          <td class="left cell-divider">18/10/26 10:00</td>
+          <td class="home-team"><a href="/displayFixture.html?id=31015803">East Leake Bantams Green^ U12</a></td>
+          <td class="score">VS</td>
+          <td class="road-team"><a href="/displayFixture.html?id=31015803">Eastwood Athletic Blazers U12</a></td>
+          <td class="left cell-divider">Costock Road LE12 6LY</td>
+          <td class="left cell-divider">U12 Sunday</td>
+          <td class="status-notes"></td>
+        </tr></table>
+        """
+
+        fixtures, _played = scrape.parse_fixture_page(html)
+        row = scrape.fixture_to_dict(fixtures[0])
+
+        assert fixtures[0].fixture_id == "31015803"
+        assert row["id"] == "31015803"
+        assert row["fixture_url"] == "https://fulltime.thefa.com/displayFixture.html?id=31015803"
+
+    def test_a_restricted_match_does_not_publish_the_fulltime_fixture(self):
+        from compliance import redact_fixture
+
+        row = scrape.fixture_to_dict(Fixture(
+            "18/10/26", "10:00", "East Leake U8", "Other U8",
+            "Ground", "U8 Sunday", fixture_id="31015803",
+        ))
+        safe = redact_fixture(row, "East Leake U8")
+
+        assert safe["id"] != "31015803"
+        assert "fixture_url" not in safe
+
     def test_results_use_the_url_the_cron_was_already_fetching(self, monkeypatch):
         seen = []
 

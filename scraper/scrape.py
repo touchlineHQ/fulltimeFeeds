@@ -152,6 +152,7 @@ class Fixture(NamedTuple):
     status: str = ""   # Full-Time status notes, e.g. "Postponed" or ""
     division_id: str = ""  # selectedFixtureGroupKey, e.g. "1_106623061"
     table_url: str = ""
+    fixture_id: str = ""  # displayFixture.html?id=, when the row links to one
 
 
 class Result(NamedTuple):
@@ -165,6 +166,7 @@ class Result(NamedTuple):
     division_label: str
     division_id: str = ""
     table_url: str = ""
+    fixture_id: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +250,8 @@ TABLE_URL = (
     "?selectedSeason={season}&selectedFixtureGroupKey={division_id}"
 )
 TEAM_URL = "https://fulltime.thefa.com/displayTeam.html?id={team_id}"
+DISPLAY_FIXTURE_URL = "https://fulltime.thefa.com/displayFixture.html?id={fixture_id}"
+_FIXTURE_HREF_RE = re.compile(r"displayFixture\.html\?id=(\d+)")
 _DIVISION_ID_RE = re.compile(r"^\d+_\d+$")
 _TEAM_ID_RE = re.compile(r"^\d+$")
 _SEASON_ID_RE = re.compile(r"^\d+$")
@@ -655,6 +659,36 @@ def merge_results(primary: list[Result], extra: list[Result]) -> list[Result]:
     return merged
 
 
+def _fixture_id_from(node) -> str:
+    """The displayFixture.html id linked from a match row, or nothing."""
+    if node is None:
+        return ""
+    link = node.find("a", href=_FIXTURE_HREF_RE)
+    if link is None:
+        return ""
+    match = _FIXTURE_HREF_RE.search(link.get("href") or "")
+    return match.group(1) if match else ""
+
+
+def _public_match_id(fixture_id: str, date: str, home: str, away: str) -> str:
+    """Prefer Full-Time's own fixture id. Fall back to the hash when a row has no link."""
+    return fixture_id or _match_id(date, home, away)
+
+
+def _published_fixture_id(row: dict) -> str:
+    """A Full-Time fixture id already written on a feed row, or nothing.
+
+    A 32-character hash is our own id, not theirs, and must not be treated as one.
+    """
+    match = _FIXTURE_HREF_RE.search(row.get("fixture_url") or "")
+    if match:
+        return match.group(1)
+    raw = str(row.get("id") or "")
+    if raw.isdigit():
+        return raw
+    return ""
+
+
 def _find_fixture_table(soup: BeautifulSoup, context: str) -> object | None:
     """Return the first table containing fixture/result rows.
 
@@ -764,6 +798,7 @@ def parse_fixture_page(html: str) -> tuple[list[Fixture], list[Result]]:
                 away_score=score[1],
                 venue=venue,
                 division_label=competition or "Unknown Division",
+                fixture_id=_fixture_id_from(row),
             ))
             continue
 
@@ -775,6 +810,7 @@ def parse_fixture_page(html: str) -> tuple[list[Fixture], list[Result]]:
             venue=venue,
             division_label=competition or "Unknown Division",
             status=status,
+            fixture_id=_fixture_id_from(row),
         ))
 
     log.info(f"  Found {len(fixtures)} fixtures ({len(played)} already played)")
@@ -996,6 +1032,7 @@ def parse_results(html: str) -> list[Result]:
             away_score=away_score,
             venue=venue,
             division_label=competition or "Unknown Division",
+            fixture_id=_fixture_id_from(row) or _fixture_id_from(home_cell),
         ))
 
     log.info(f"  Found {len(results)} results")
@@ -1218,7 +1255,7 @@ def fixture_to_iso_date(date_str: str) -> str:
 def fixture_to_dict(fixture: Fixture) -> dict:
     """Serialise a Fixture to a plain dict for JSON output."""
     row = {
-        "id": _match_id(fixture.date, fixture.home_team, fixture.away_team),
+        "id": _public_match_id(fixture.fixture_id, fixture.date, fixture.home_team, fixture.away_team),
         "date": fixture_to_iso_date(fixture.date),
         "time": fixture.time or "10:00",
         "home_team": fixture.home_team,
@@ -1226,6 +1263,8 @@ def fixture_to_dict(fixture: Fixture) -> dict:
         "venue": fixture.venue,
         "division": fixture.division_label,
     }
+    if fixture.fixture_id:
+        row["fixture_url"] = DISPLAY_FIXTURE_URL.format(fixture_id=fixture.fixture_id)
     if fixture.division_id:
         row["division_id"] = fixture.division_id
         row["table_url"] = fixture.table_url
@@ -1235,7 +1274,7 @@ def fixture_to_dict(fixture: Fixture) -> dict:
 def result_to_dict(result: Result) -> dict:
     """Serialise a Result to a plain dict for JSON output."""
     row = {
-        "id": _match_id(result.date, result.home_team, result.away_team),
+        "id": _public_match_id(result.fixture_id, result.date, result.home_team, result.away_team),
         "date": fixture_to_iso_date(result.date),
         "time": result.time or "10:00",
         "home_team": result.home_team,
@@ -1245,6 +1284,8 @@ def result_to_dict(result: Result) -> dict:
         "venue": result.venue,
         "division": result.division_label,
     }
+    if result.fixture_id:
+        row["fixture_url"] = DISPLAY_FIXTURE_URL.format(fixture_id=result.fixture_id)
     if result.division_id:
         row["division_id"] = result.division_id
         row["table_url"] = result.table_url
@@ -1275,6 +1316,7 @@ def result_from_published(row: dict) -> Result | None:
         division_label=row.get("division") or "",
         division_id=row.get("division_id") or "",
         table_url=row.get("table_url") or "",
+        fixture_id=_published_fixture_id(row),
     )
 
 
