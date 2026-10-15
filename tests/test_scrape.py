@@ -2367,3 +2367,18 @@ def test_merge_results_keeps_same_day_distinct_fixtures_separate():
     assert by_key[("01/09/26", "14:00", "U12")].fixture_id == "999"
     assert by_key[("01/09/26", "10:00", "U13")].fixture_id == ""
     assert by_key[("01/09/26", "10:00", "U13")].home_score == 2
+
+
+def test_unlinked_ids_differ_by_kickoff_and_division():
+    from scrape import _public_match_id, drop_settled_fixtures
+    a = _public_match_id("", "2026-10-18", "A", "B", "10:00", "U12 League")
+    b = _public_match_id("", "2026-10-18", "A", "B", "14:00", "U12 League")
+    c = _public_match_id("", "2026-10-18", "A", "B", "10:00", "U12 Cup")
+    assert len({a, b, c}) == 3
+    assert _public_match_id("123", "2026-10-18", "A", "B", "10:00", "x") == "123"
+    base = {"date": "2026-10-18", "home_team": "A", "away_team": "B", "division": "U12 League"}
+    fixtures = [dict(base, id=b, time="14:00")]
+    # A hash id on a result only settles a fixture with the complete key.
+    results = [dict(base, id=b, time="10:00")]
+    assert drop_settled_fixtures(fixtures, results) == fixtures
+    assert drop_settled_fixtures(fixtures, [dict(base, id="x", time="14:00")]) == []

@@ -681,9 +681,18 @@ def _fixture_id_from(node) -> str:
     return match.group(1) if match else ""
 
 
-def _public_match_id(fixture_id: str, date: str, home: str, away: str) -> str:
-    """Prefer Full-Time's own fixture id. Fall back to the hash when a row has no link."""
-    return fixture_id or _match_id(date, home, away)
+def _public_match_id(
+    fixture_id: str, date: str, home: str, away: str, time: str = "", division: str = "",
+) -> str:
+    """Prefer Full-Time's own fixture id. Fall back to a hash when a row has no link.
+
+    The hash covers kick-off and division as well as the teams, so two unlinked
+    matches between the same sides on one day get distinct ids. Calendar event
+    ids use ``_match_id`` and are unaffected.
+    """
+    if fixture_id:
+        return fixture_id
+    return hashlib.md5(f"{date}|{time}|{home}|{away}|{division}".encode()).hexdigest()
 
 
 def _published_fixture_id(row: dict) -> str:
@@ -1318,7 +1327,10 @@ def fixture_to_iso_date(date_str: str) -> str:
 def fixture_to_dict(fixture: Fixture) -> dict:
     """Serialise a Fixture to a plain dict for JSON output."""
     row = {
-        "id": _public_match_id(fixture.fixture_id, fixture.date, fixture.home_team, fixture.away_team),
+        "id": _public_match_id(
+            fixture.fixture_id, fixture.date, fixture.home_team, fixture.away_team,
+            fixture.time or "10:00", fixture.division_label,
+        ),
         "date": fixture_to_iso_date(fixture.date),
         "time": fixture.time or "10:00",
         "home_team": fixture.home_team,
@@ -1337,7 +1349,10 @@ def fixture_to_dict(fixture: Fixture) -> dict:
 def result_to_dict(result: Result) -> dict:
     """Serialise a Result to a plain dict for JSON output."""
     row = {
-        "id": _public_match_id(result.fixture_id, result.date, result.home_team, result.away_team),
+        "id": _public_match_id(
+            result.fixture_id, result.date, result.home_team, result.away_team,
+            result.time or "10:00", result.division_label,
+        ),
         "date": fixture_to_iso_date(result.date),
         "time": result.time or "10:00",
         "home_team": result.home_team,
@@ -1475,7 +1490,9 @@ def drop_settled_fixtures(
     arrives from both pages.  A settled match is recognised by its id or by its
     date, kick-off, both team names and division, and is listed as a result only.
     """
-    played = {row["id"] for row in result_rows if row.get("id")}
+    # Only a Full-Time fixture id settles a fixture on its own. A hash id must
+    # also match on the complete key below.
+    played = {_published_fixture_id(row) for row in result_rows} - {""}
     # An id is Full-Time's fixture id only when the row linked to one, so the
     # fixture and its result can carry different ids. Match on the teams too.
     # When either side has no fixture link its id is our hash, so match on
@@ -1487,7 +1504,7 @@ def drop_settled_fixtures(
     } - {None}
     out = []
     for row in fixture_rows:
-        if row.get("id") in played:
+        if _published_fixture_id(row) in played:
             continue
         key = _settled_key(row)
         if key in (all_keys if not row.get("fixture_url") else unlinked_keys):
