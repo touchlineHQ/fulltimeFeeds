@@ -116,7 +116,7 @@ Result (in `results.json` and `results` arrays):
 
 Team and club feeds additionally include `league`, `team`, `home_away` (`"home"` or `"away"`), `opponent`, and (results only) `goals_for` and `goals_against`.
 
-`id` is Full-Time's own fixture id when the row links to `displayFixture.html?id=`, and `fixture_url` is that match page. A row with no such link keeps the previous hash. U11 and below do not publish either: that page names the opposition. `division_id` and `table_url` are present only when the division is a league table Full-Time publishes. Cup ties are left out of those, and so is anything at U11 or below. The division id is the fixture-group key (`1_106623061` for U14 Sunday), not the match id.
+`id` is Full-Time's own fixture id when the row links to `displayFixture.html?id=`, and `fixture_url` is that match page. A row with no such link keeps the previous hash. U11 and below publish neither the Full-Time id nor `fixture_url`, because that page names the opposition; those rows keep an `id`, but it is a restricted record id of their own. `division_id` and `table_url` are present only when the division is a league table Full-Time publishes. Cup ties are left out of those, and so is anything at U11 or below. The division id is the fixture-group key (`1_106623061` for U14 Sunday), not the match id.
 
 An open-age team feed also has `team_id` and `fulltime_url` (`displayTeam.html?id=`). `teams.json`, the index, and a club feed's `teams` array carry the same pair. U11 and below do not, for now.
 
@@ -146,7 +146,7 @@ place:
 - **Participation stays per team.** A derby at U11 or below produces a
   participation record for each of the club's teams: both of them played.
 
-`id` is the same on the fixtures and results pages, because both link to the same Full-Time match. Consumers can key on it. Calendars keep their existing event ids, so a subscription does not gain a second copy of each match.
+`id` is the same on the fixtures and results pages when both link to the same Full-Time match. If only one of them has the link, one row carries Full-Time's id and the other the hash, so `id` alone is not a reliable join between the two pages; the feeds settle that case by date, kick-off, teams and division. Calendars keep their existing event ids, so a subscription does not gain a second copy of each match.
 
 ### Publication rules for U11 and below
 

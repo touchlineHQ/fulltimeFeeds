@@ -1883,6 +1883,42 @@ class TestCalledOffStatus:
 
         assert scrape.drop_settled_fixtures([fixture], [result]) == []
 
+    def test_an_unlinked_result_in_another_competition_does_not_settle_a_fixture(self):
+        fixture = scrape.fixture_to_dict(Fixture(
+            "18/10/26", "10:00", "Home U12", "Away U12",
+            "Ground", "U12 Sunday", fixture_id="31015803",
+        ))
+        other_cup = scrape.result_to_dict(scrape.Result(
+            "18/10/26", "10:00", "Home U12", "Away U12", 2, 1,
+            "Ground", "U12 Cup",
+        ))
+        other_kickoff = scrape.result_to_dict(scrape.Result(
+            "18/10/26", "14:00", "Home U12", "Away U12", 2, 1,
+            "Ground", "U12 Sunday",
+        ))
+
+        assert scrape.drop_settled_fixtures([fixture], [other_cup, other_kickoff]) == [fixture]
+
+    def test_a_result_link_only_in_the_away_cell_is_the_fixture_id(self):
+        # Home and road cells in separate containers: the row the parser keeps
+        # is the home cell's, so the link has to be read from the away cell.
+        html = """
+        <div id="results">
+          <div class="r"><span>18/10/26 10:00</span><span class="home-team">Home U12</span><span class="score">2 - 1</span></div>
+          <span class="road-team"><a href="/displayFixture.html?id=31015803">Away U12</a></span>
+          <span class="comp">U12 Sunday</span><span class="status-notes"></span>
+          <div class="r"><span>19/10/26 10:00</span><span class="home-team">Other U12</span><span class="score">0 - 0</span></div>
+          <span class="road-team">Rival U12</span>
+          <span class="comp">U12 Sunday</span><span class="status-notes"></span>
+        </div>
+        """
+
+        results = scrape.parse_results(html)
+
+        assert results[0].home_team == "Home U12"
+        assert results[0].fixture_id == "31015803"
+        assert results[1].fixture_id == ""
+
     def test_a_restricted_match_does_not_publish_the_fulltime_fixture(self):
         from compliance import redact_fixture
 

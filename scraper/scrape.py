@@ -1032,7 +1032,11 @@ def parse_results(html: str) -> list[Result]:
             away_score=away_score,
             venue=venue,
             division_label=competition or "Unknown Division",
-            fixture_id=_fixture_id_from(row) or _fixture_id_from(home_cell),
+            fixture_id=(
+                _fixture_id_from(row)
+                or _fixture_id_from(home_cell)
+                or _fixture_id_from(away_cell)
+            ),
         ))
 
     log.info(f"  Found {len(results)} results")
@@ -1410,13 +1414,14 @@ def drop_settled_fixtures(
     Full-Time keeps a played match on its fixtures page while the league enters
     the score, and in some competitions after that too, so the same match
     arrives from both pages.  A settled match is recognised by its id or by its
-    date and both team names, and is listed as a result only.
+    date, kick-off, both team names and division, and is listed as a result only.
     """
     played = {row["id"] for row in result_rows if row.get("id")}
     # An id is Full-Time's fixture id only when the row linked to one, so the
     # fixture and its result can carry different ids. Match on the teams too.
     # When either side has no fixture link its id is our hash, so match on
-    # date and teams instead. Two linked rows are compared by id alone.
+    # date, kick-off, teams and division instead. Two linked rows are compared
+    # by id alone.
     all_keys = {_settled_key(row) for row in result_rows} - {None}
     unlinked_keys = {
         _settled_key(row) for row in result_rows if not row.get("fixture_url")
@@ -1433,7 +1438,15 @@ def drop_settled_fixtures(
 
 
 def _settled_key(row: dict) -> tuple | None:
-    key = (row.get("date"), row.get("home_team"), row.get("away_team"))
+    # Kick-off and division as well as the teams: two matches between the same
+    # sides on one day, in different competitions, must not settle each other.
+    key = (
+        row.get("date"),
+        row.get("time"),
+        row.get("home_team"),
+        row.get("away_team"),
+        row.get("division"),
+    )
     return key if all(key) else None
 
 
