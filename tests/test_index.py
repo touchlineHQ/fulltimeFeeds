@@ -182,8 +182,8 @@ class TestClubEntries:
         ])
 
         assert club_entries(tmp_path) == [
-            {"name": "Arnold Town", "slug": "arnold-town", "league": "Euro Soccer 26/27"},
-            {"name": "Demo FC", "slug": "demo-fc", "league": "Demo FC"},
+            {"name": "Arnold Town", "slug": "arnold-town", "league": "Euro Soccer 26/27", "league_slug": "euro-soccer-26-27"},
+            {"name": "Demo FC", "slug": "demo-fc", "league": "Demo FC", "league_slug": "demo-fc"},
         ]
 
     def test_club_spanning_multiple_leagues_gives_one_entry_per_league(self, tmp_path):
@@ -193,8 +193,8 @@ class TestClubEntries:
         ])
 
         assert club_entries(tmp_path) == [
-            {"name": "Demo FC", "slug": "demo-fc", "league": "Senior League"},
-            {"name": "Demo FC", "slug": "demo-fc", "league": "Youth League"},
+            {"name": "Demo FC", "slug": "demo-fc", "league": "Senior League", "league_slug": "senior-league"},
+            {"name": "Demo FC", "slug": "demo-fc", "league": "Youth League", "league_slug": "youth-league"},
         ]
 
     def test_club_without_leagues_falls_back_to_empty_league(self, tmp_path):
@@ -210,7 +210,7 @@ class TestClubEntries:
         _write_club(tmp_path, "ok-club", "OK Club", fixtures=[{"league": "L1"}])
         (tmp_path / "clubs" / "broken.json").write_text("not json", encoding="utf-8")
 
-        assert club_entries(tmp_path) == [{"name": "OK Club", "slug": "ok-club", "league": "L1"}]
+        assert club_entries(tmp_path) == [{"name": "OK Club", "slug": "ok-club", "league": "L1", "league_slug": "l1"}]
 
     def test_missing_clubs_dir_gives_empty(self, tmp_path):
         assert club_entries(tmp_path) == []
@@ -221,7 +221,7 @@ class TestClubEntries:
 
         index = build_index(tmp_path, generated="2026-01-01T00:00:00Z")
 
-        assert index["clubs"] == [{"name": "Demo FC", "slug": "demo-fc", "league": "Demo FC"}]
+        assert index["clubs"] == [{"name": "Demo FC", "slug": "demo-fc", "league": "Demo FC", "league_slug": "demo-fc"}]
 
 
 class TestWriteIndex:
