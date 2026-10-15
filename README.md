@@ -54,7 +54,7 @@ array, and a `clubs` array:
     }
   ],
   "clubs": [
-    { "name": "Arnold Town", "slug": "arnold-town", "league": "Euro Soccer Nottinghamshire Senior League 26/27" }
+    { "name": "Arnold Town", "slug": "arnold-town", "league": "Euro Soccer Nottinghamshire Senior League 26/27", "league_slug": "euro-soccer-nottinghamshire-senior-league-26-27" }
   ]
 }
 ```
@@ -115,6 +115,8 @@ Result (in `results.json` and `results` arrays):
 ```
 
 Team and club feeds additionally include `league`, `team`, `home_away` (`"home"` or `"away"`), `opponent`, and (results only) `goals_for` and `goals_against`.
+
+Slugs are the path to another feed. A team feed carries `team_slug`, `league_slug`, `club` and `club_slug` once at the top because every row is that team in that league. An open-age row may also include `opponent_slug` when that opponent has a published team feed. A league feed carries `league_slug` at the top; each row may include `home_team_slug` and `away_team_slug` when those sides have published team feeds, and `home_club_slug` / `away_club_slug` when those clubs have feeds. A club feed carries `club_slug` at the top and a `teams` array of `{name, team_slug, league, league_slug}` (plus `team_id` and `fulltime_url` when those exist). Its match rows repeat `team_slug` and `league_slug` because the file mixes both. `teams.json` uses the existing `slug` for the team and adds `club` and `club_slug`. The index's club entries add `league_slug`. Join them up as `feeds/<league_slug>/teams/<team_slug>.json` and `feeds/clubs/<club_slug>.json`. When a published-feed mapping is supplied (the normal scrape and demo paths), a team slug is only written when that exact feed exists, so a team with no feed of its own keeps its name but has no slug. Direct writer helpers used in unit tests may still emit a derived slug without that mapping.
 
 `id` is Full-Time's own fixture id when the row links to `displayFixture.html?id=`, and `fixture_url` is that match page. A row with no such link keeps the previous hash. U11 and below publish neither the Full-Time id nor `fixture_url`, because that page names the opposition; those rows keep an `id`, but it is a restricted record id of their own. `division_id` and `table_url` are present only when the division is a league table Full-Time publishes. Cup ties are left out of those, and so is anything at U11 or below. The division id is the fixture-group key (`1_106623061` for U14 Sunday), not the match id.
 

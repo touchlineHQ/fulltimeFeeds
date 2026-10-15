@@ -24,6 +24,7 @@ from compliance import (
     split_results,
 )
 from index import write_index
+from scrape import club_team_directory, stamp_row_links
 
 FEEDS_DIR = Path(__file__).parent.parent / "feeds"
 
@@ -253,6 +254,10 @@ def generate(today: date | None = None) -> None:
                 f.unlink()
     teams_dir.mkdir(parents=True, exist_ok=True)
 
+    # Only the club's own teams have a demo feed; pool opponents do not, and a
+    # team's file is named by its TeamDef slug, not by slugging its name.
+    team_slugs = {td.name: td.slug for td in TEAM_DEFS}
+
     index_teams: list[dict] = []
     club_fixtures: list[dict] = []
     club_results: list[dict] = []
@@ -283,11 +288,21 @@ def generate(today: date | None = None) -> None:
         team_results, team_participation = split_results(results)
         team_feed = {
             "team": td.name,
+            "team_slug": td.slug,
             "league": LEAGUE_NAME,
+            "league_slug": LEAGUE_SLUG,
+            "club": CLUB_NAME,
+            "club_slug": CLUB_SLUG,
             "generated": generated_ts,
             "compliance": compliance_meta(len(team_participation)),
-            "fixtures": safe_fixtures(fixtures, subject_team=td.name),
-            "results": team_results,
+            "fixtures": [
+                stamp_row_links(row, identity=False, team_slugs=team_slugs)
+                for row in safe_fixtures(fixtures, subject_team=td.name)
+            ],
+            "results": [
+                stamp_row_links(row, identity=False, team_slugs=team_slugs)
+                for row in team_results
+            ],
             "participation": team_participation,
         }
         (teams_dir / f"{td.slug}.json").write_text(json.dumps(team_feed, indent=2) + "\n")
@@ -299,20 +314,40 @@ def generate(today: date | None = None) -> None:
         for res in results:
             club_results.append({**res, "league": LEAGUE_NAME, "team": td.name})
 
-        index_teams.append({"name": td.name, "slug": td.slug})
+        index_teams.append({
+            "name": td.name,
+            "slug": td.slug,
+            "club": CLUB_NAME,
+            "club_slug": CLUB_SLUG,
+        })
 
     # --------------------------------------------------------------- club feed
     clubs_dir = FEEDS_DIR / "clubs"
     clubs_dir.mkdir(exist_ok=True)
     safe_club_fixtures = [
-        redact_fixture(row, row.get("team")) if is_row_restricted(row) else row
+        stamp_row_links(
+            redact_fixture(row, row.get("team")) if is_row_restricted(row) else row,
+            sides=True,
+            team_slugs=team_slugs,
+        )
         for row in club_fixtures
     ]
     safe_club_results, club_participation = split_results(club_results)
+    safe_club_results = [
+        stamp_row_links(row, sides=True, team_slugs=team_slugs) for row in safe_club_results
+    ]
+    club_participation = [
+        stamp_row_links(row, team_slugs=team_slugs) for row in club_participation
+    ]
     club_feed = {
         "club": CLUB_NAME,
+        "club_slug": CLUB_SLUG,
         "generated": generated_ts,
         "compliance": compliance_meta(len(club_participation)),
+        "teams": club_team_directory(
+            [*club_fixtures, *club_results, *club_participation],
+            team_feeds={LEAGUE_NAME: team_slugs},
+        ),
         "fixtures": sorted(safe_club_fixtures, key=lambda f: (f["date"], f["team"])),
         "results":  sorted(safe_club_results,  key=lambda r: (r["date"], r["team"]), reverse=True),
         "participation": sorted(club_participation, key=lambda r: (r["date"], r["team"]), reverse=True),
@@ -323,11 +358,25 @@ def generate(today: date | None = None) -> None:
     # A league-wide listing has no subject club: each row would name two teams
     # to each other, so U11-and-below matches are withheld from it entirely.
     league_matches = _dedupe_by_id(club_fixtures)
+    demo_teams = {td.name for td in TEAM_DEFS}
+
+    def _with_club_slugs(row: dict) -> dict:
+        if row.get("home_team") in demo_teams:
+            row["home_club_slug"] = CLUB_SLUG
+        if row.get("away_team") in demo_teams:
+            row["away_club_slug"] = CLUB_SLUG
+        return row
+
     league_fixture_rows = [
-        {k: f[k] for k in _FIXTURE_KEYS} for f in league_matches if not is_row_restricted(f)
+        _with_club_slugs(stamp_row_links(
+            {k: f[k] for k in _FIXTURE_KEYS}, identity=False, sides=True,
+            team_slugs=team_slugs,
+        ))
+        for f in league_matches if not is_row_restricted(f)
     ]
     fixtures_payload = {
         "league": LEAGUE_NAME,
+        "league_slug": LEAGUE_SLUG,
         "generated": generated_ts,
         "compliance": {
             **compliance_meta(),
@@ -337,11 +386,16 @@ def generate(today: date | None = None) -> None:
     }
     (league_dir / "fixtures.json").write_text(json.dumps(fixtures_payload, indent=2) + "\n")
 
-    league_result_rows, league_results_withheld = safe_results(
-        [{k: r[k] for k in _RESULT_KEYS} for r in _dedupe_by_id(club_results)]
-    )
+    league_result_rows, league_results_withheld = safe_results([
+        _with_club_slugs(stamp_row_links(
+            {k: r[k] for k in _RESULT_KEYS}, identity=False, sides=True,
+            team_slugs=team_slugs,
+        ))
+        for r in _dedupe_by_id(club_results)
+    ])
     results_payload = {
         "league": LEAGUE_NAME,
+        "league_slug": LEAGUE_SLUG,
         "generated": generated_ts,
         "compliance": compliance_meta(league_results_withheld),
         "results": sorted(
@@ -355,6 +409,7 @@ def generate(today: date | None = None) -> None:
     index_teams.sort(key=lambda t: t["name"])
     teams_payload = {
         "league": LEAGUE_NAME,
+        "league_slug": LEAGUE_SLUG,
         "generated": generated_ts,
         "teams": index_teams,
     }

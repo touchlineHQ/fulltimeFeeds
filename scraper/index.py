@@ -10,6 +10,7 @@ the brittle read-modify-merge approach.
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,6 +18,11 @@ log = logging.getLogger(__name__)
 
 FEEDS_DIR = Path(__file__).parent.parent / "feeds"
 CLUBS_DIR_NAME = "clubs"
+
+
+def _slug(name: str) -> str:
+    """Same rule as scrape.slug. Kept here so the index does not import the scraper."""
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
 def league_dirs(feeds_dir: Path = FEEDS_DIR) -> list[Path]:
@@ -99,9 +105,9 @@ def league_entries(feeds_dir: Path = FEEDS_DIR) -> list[dict]:
 def club_entries(feeds_dir: Path = FEEDS_DIR) -> list[dict]:
     """Build club entries from feeds/clubs/*.json.
 
-    Each club feed is read for its "club" name; one {"name", "slug", "league"}
-    entry is emitted per distinct league found across its fixtures/results, so
-    clubs spanning several leagues have an entry per league.
+    Each club feed is read for its "club" name; one {"name", "slug", "league",
+    "league_slug"} entry is emitted per distinct league found across its
+    fixtures/results, so clubs spanning several leagues have an entry per league.
     """
     clubs_dir = feeds_dir / CLUBS_DIR_NAME
     if not clubs_dir.is_dir():
@@ -122,7 +128,10 @@ def club_entries(feeds_dir: Path = FEEDS_DIR) -> list[dict]:
             if row.get("league")
         }) or [""]
         for league in leagues:
-            entries.append({"name": name, "slug": slug_name, "league": league})
+            entry = {"name": name, "slug": slug_name, "league": league}
+            if league:
+                entry["league_slug"] = _slug(league)
+            entries.append(entry)
 
     entries.sort(key=lambda e: (e["name"].lower(), e["slug"], e["league"]))
     return entries
