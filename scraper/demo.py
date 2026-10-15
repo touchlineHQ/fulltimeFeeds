@@ -254,6 +254,10 @@ def generate(today: date | None = None) -> None:
                 f.unlink()
     teams_dir.mkdir(parents=True, exist_ok=True)
 
+    # Only the club's own teams have a demo feed; pool opponents do not, and a
+    # team's file is named by its TeamDef slug, not by slugging its name.
+    team_slugs = {td.name: td.slug for td in TEAM_DEFS}
+
     index_teams: list[dict] = []
     club_fixtures: list[dict] = []
     club_results: list[dict] = []
@@ -292,10 +296,13 @@ def generate(today: date | None = None) -> None:
             "generated": generated_ts,
             "compliance": compliance_meta(len(team_participation)),
             "fixtures": [
-                stamp_row_links(row, identity=False)
+                stamp_row_links(row, identity=False, team_slugs=team_slugs)
                 for row in safe_fixtures(fixtures, subject_team=td.name)
             ],
-            "results": [stamp_row_links(row, identity=False) for row in team_results],
+            "results": [
+                stamp_row_links(row, identity=False, team_slugs=team_slugs)
+                for row in team_results
+            ],
             "participation": team_participation,
         }
         (teams_dir / f"{td.slug}.json").write_text(json.dumps(team_feed, indent=2) + "\n")
@@ -321,18 +328,26 @@ def generate(today: date | None = None) -> None:
         stamp_row_links(
             redact_fixture(row, row.get("team")) if is_row_restricted(row) else row,
             sides=True,
+            team_slugs=team_slugs,
         )
         for row in club_fixtures
     ]
     safe_club_results, club_participation = split_results(club_results)
-    safe_club_results = [stamp_row_links(row, sides=True) for row in safe_club_results]
-    club_participation = [stamp_row_links(row) for row in club_participation]
+    safe_club_results = [
+        stamp_row_links(row, sides=True, team_slugs=team_slugs) for row in safe_club_results
+    ]
+    club_participation = [
+        stamp_row_links(row, team_slugs=team_slugs) for row in club_participation
+    ]
     club_feed = {
         "club": CLUB_NAME,
         "club_slug": CLUB_SLUG,
         "generated": generated_ts,
         "compliance": compliance_meta(len(club_participation)),
-        "teams": club_team_directory([*club_fixtures, *club_results, *club_participation]),
+        "teams": club_team_directory(
+            [*club_fixtures, *club_results, *club_participation],
+            team_feeds={LEAGUE_NAME: team_slugs},
+        ),
         "fixtures": sorted(safe_club_fixtures, key=lambda f: (f["date"], f["team"])),
         "results":  sorted(safe_club_results,  key=lambda r: (r["date"], r["team"]), reverse=True),
         "participation": sorted(club_participation, key=lambda r: (r["date"], r["team"]), reverse=True),
@@ -355,6 +370,7 @@ def generate(today: date | None = None) -> None:
     league_fixture_rows = [
         _with_club_slugs(stamp_row_links(
             {k: f[k] for k in _FIXTURE_KEYS}, identity=False, sides=True,
+            team_slugs=team_slugs,
         ))
         for f in league_matches if not is_row_restricted(f)
     ]
@@ -373,6 +389,7 @@ def generate(today: date | None = None) -> None:
     league_result_rows, league_results_withheld = safe_results([
         _with_club_slugs(stamp_row_links(
             {k: r[k] for k in _RESULT_KEYS}, identity=False, sides=True,
+            team_slugs=team_slugs,
         ))
         for r in _dedupe_by_id(club_results)
     ])

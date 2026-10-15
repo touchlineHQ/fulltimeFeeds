@@ -13,7 +13,7 @@ import hashlib
 import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Iterable, NamedTuple
+from typing import Iterable, Mapping, NamedTuple
 
 from curl_cffi import requests as curl_requests
 from bs4 import BeautifulSoup
@@ -1040,7 +1040,13 @@ def slug(name: str) -> str:
     return s.strip("-")
 
 
-def stamp_row_links(row: dict, *, identity: bool = True, sides: bool = False) -> dict:
+def stamp_row_links(
+    row: dict,
+    *,
+    identity: bool = True,
+    sides: bool = False,
+    team_slugs: Mapping[str, str] | None = None,
+) -> dict:
     """Add slugs beside names that point at another feed.
 
     ``identity`` is the subject team and its league. A team feed leaves that
@@ -1048,22 +1054,33 @@ def stamp_row_links(row: dict, *, identity: bool = True, sides: bool = False) ->
     ``sides`` slugs ``home_team`` and ``away_team``, which a league listing
     needs because it has no subject team. ``Opposition`` is the redacted
     label, not a team, and is never slugged.
+
+    ``team_slugs`` maps the names of teams whose feed was written in the
+    row's league to that feed's slug. When given, a team slug is only added
+    for a name in it, so a link never points at a file that does not exist.
     """
+    def team_slug_for(name: str | None) -> str | None:
+        if not name or name == OPPONENT_LABEL:
+            return None
+        if team_slugs is None:
+            return slug(name)
+        return team_slugs.get(name)
+
     if identity:
-        team = row.get("team")
-        if team and team != OPPONENT_LABEL:
-            row["team_slug"] = slug(team)
+        team_slug_value = team_slug_for(row.get("team"))
+        if team_slug_value:
+            row["team_slug"] = team_slug_value
         league = row.get("league")
         if league:
             row["league_slug"] = slug(league)
-    opponent = row.get("opponent")
-    if opponent and opponent != OPPONENT_LABEL:
-        row["opponent_slug"] = slug(opponent)
+    opponent_slug = team_slug_for(row.get("opponent"))
+    if opponent_slug:
+        row["opponent_slug"] = opponent_slug
     if sides:
         for field in ("home_team", "away_team"):
-            name = row.get(field)
-            if name and name != OPPONENT_LABEL:
-                row[f"{field}_slug"] = slug(name)
+            side_slug = team_slug_for(row.get(field))
+            if side_slug:
+                row[f"{field}_slug"] = side_slug
     return row
 
 
@@ -2091,11 +2108,14 @@ def build_prefix_counts(team_names: list[str]) -> dict[str, int]:
 def club_team_directory(
     rows: list[dict],
     team_pages: dict[str, dict] | None = None,
+    team_feeds: Mapping[str, Mapping[str, str]] | None = None,
 ) -> list[dict]:
     """One entry per team and league, enough to open that team's feed.
 
     A club feed mixes leagues, so the pair lives here rather than on every
     match. Full-Time links are included when that team has a page.
+    ``team_feeds`` maps league name to the team feeds written in it (name to
+    slug); when given, ``team_slug`` is only set for a feed that exists.
     """
     pages = team_pages or {}
     found: dict[tuple[str, str], dict] = {}
@@ -2107,7 +2127,11 @@ def club_team_directory(
         key = (team, league)
         if key in found:
             continue
-        entry = {"name": team, "team_slug": slug(team)}
+        entry = {"name": team}
+        if team_feeds is None:
+            entry["team_slug"] = slug(team)
+        elif team in team_feeds.get(league, {}):
+            entry["team_slug"] = team_feeds[league][team]
         if league:
             entry["league"] = league
             entry["league_slug"] = slug(league)
@@ -2128,8 +2152,14 @@ def write_club_feed(
     results_unavailable: bool = False,
     extra_participation: list[dict] | None = None,
     team_pages: dict[str, dict] | None = None,
+    team_feeds: Mapping[str, Mapping[str, str]] | None = None,
 ) -> None:
     """Write feeds/clubs/<slug>.json aggregating all teams in a club across leagues.
+
+    ``team_feeds`` maps league name to the team feeds written this run (team
+    name to slug). When given, a row only links to a team feed that exists in
+    that row's own league, so a name shared across leagues, or a retained
+    record whose feed was not rewritten, never points at a missing file.
 
     Every row here is already scoped to one of the club's own teams (it carries
     `team` and `home_away`), so restricted fixtures keep that team's name and
@@ -2171,6 +2201,10 @@ def write_club_feed(
         for row in consolidate_matches(fixture_rows)
     ]
 
+    def link(row: dict, **kwargs) -> dict:
+        slugs = None if team_feeds is None else team_feeds.get(row.get("league") or "", {})
+        return stamp_row_links(row, team_slugs=slugs, **kwargs)
+
     payload = {
         "club": club_name,
         "club_slug": club_slug,
@@ -2178,16 +2212,16 @@ def write_club_feed(
         **({"results_unavailable": True} if results_unavailable else {}),
         "compliance": compliance_meta(results_withheld),
         "fixtures": sorted(
-            [stamp_row_links(row, sides=True) for row in safe_club_fixtures],
+            [link(row, sides=True) for row in safe_club_fixtures],
             key=lambda x: (x["date"], x["time"]),
         ),
         "results": sorted(
-            [stamp_row_links(row, sides=True) for row in safe_club_results],
+            [link(row, sides=True) for row in safe_club_results],
             key=lambda x: (x["date"], x["time"]),
             reverse=True,
         ),
         "participation": sorted(
-            [stamp_row_links(row) for row in club_participation],
+            [link(row) for row in club_participation],
             key=lambda x: (x["date"], x["time"]),
             reverse=True,
         ),
@@ -2195,6 +2229,7 @@ def write_club_feed(
     teams = club_team_directory(
         [*fixture_rows, *result_rows, *club_participation],
         team_pages,
+        team_feeds,
     )
     if teams:
         payload["teams"] = teams
@@ -2447,6 +2482,9 @@ def _run(browser_holder: list) -> int:
     # them has an incomplete results array, and its feed says so.
     leagues_without_results: set[str] = set()
     scraped_league_slugs: set[str] = set()
+    # League name -> {team name: slug} for every team feed written this run,
+    # so the club feeds only link to files that exist.
+    written_team_feeds: dict[str, dict[str, str]] = {}
 
     # How each league's results were obtained, summarised at the end of the run.
     # A log this long is unreadable otherwise, and "0 results" means nothing
@@ -2648,6 +2686,7 @@ def _run(browser_holder: list) -> int:
                 extra_participation=retained_participation.get(team_name, []),
                 team_page=page or None,
             )
+            written_team_feeds.setdefault(league_name, {})[team_name] = team_slug_name
             team_index_entries.append({"name": team_name, "slug": team_slug_name, **page})
 
             # Collect enriched dicts for club-level aggregation
@@ -2710,6 +2749,7 @@ def _run(browser_holder: list) -> int:
             results_unavailable=bool(club_leagues & leagues_without_results),
             extra_participation=extra,
             team_pages=team_pages,
+            team_feeds=written_team_feeds,
         )
         teams_in_club = sorted(
             {r["team"] for r in club_fixtures.get(club_name, [])}
